@@ -1,0 +1,33 @@
+# Render.com blueprint. Push this repo to GitHub, then in Render:
+# New + -> Blueprint -> pick your repo. It reads this file.
+services:
+  - type: web
+    name: attestly
+    runtime: python
+    plan: starter          # free/cheap tier; upgrade later
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    disk:
+      name: attestly-data  # persists attestly.db + signing_key.hex across deploys
+      mountPath: /var/data
+      sizeGB: 1
+    envVars:
+      - key: ATTESTLY_DB
+        value: /var/data/attestly.db
+      - key: ATTESTLY_KEY
+        value: /var/data/signing_key.hex
+      - key: ADMIN_TOKEN
+        sync: false        # set in the Render dashboard (secret)
+      - key: PAYTO_ADDRESS
+        sync: false
+      - key: BASE_URL
+        sync: false        # e.g. https://attestly.co
+      - key: PAY_NETWORK
+        value: base
+      - key: PAY_ASSET
+        value: USDC
+      - key: ALLOW_UNVERIFIED_PAYMENTS
+        value: "true"
+      - key: FACILITATOR_URL
+        value: ""

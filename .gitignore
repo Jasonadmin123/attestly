@@ -1,0 +1,5 @@
+.env
+signing_key.hex
+trustforge.db
+__pycache__/
+*.pyc
