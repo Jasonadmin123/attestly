@@ -43,6 +43,25 @@ Docker and Procfile are included if you prefer Fly.io / Railway / any container 
 > The persistent disk in `render.yaml` keeps `attestly.db` and `signing_key.hex` across deploys.
 > **Back up `signing_key.hex`** — it's the identity behind every signature.
 
+## Agent discovery (getting found by AI)
+The service is machine-discoverable at:
+- Manifest: `GET /` · A2A agent card: `GET /.well-known/agent.json` (and `/agent-card.json`)
+- `GET /llms.txt` — plain-text description for LLM/agent crawlers
+- Public key: `GET /.well-known/attestly-pubkey`
+
+Register the A2A card at a2a-registry.org and agenstry.com. Add the repo to
+awesome-x402 (github.com/xpaysh/awesome-x402).
+
+## MCP server (list on MCP registries)
+`mcp_server.py` exposes Attestly as MCP tools (`get_services`, `request_verification`,
+`get_attestation`) so any MCP-capable agent can call it.
+```bash
+pip install mcp httpx
+python mcp_server.py          # stdio transport
+```
+List it on the MCP registries (Smithery, Glama, PulseMCP, mcp.so, official MCP Registry) —
+most accept a GitHub repo or a hosted URL.
+
 ## Stay out of regulation
 Verify facts and entities only. No legal/medical/financial **advice**, no handling other
 people's money, no KYC/identity proxying. Keep that line and you stay clear of licensed activity.

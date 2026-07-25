@@ -31,7 +31,7 @@ from contextlib import closing
 
 import httpx
 from fastapi import FastAPI, HTTPException, Header
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from nacl.signing import SigningKey
 from nacl.encoding import HexEncoder
@@ -206,6 +206,59 @@ def manifest():
 @app.get("/.well-known/attestly-pubkey")
 def pubkey():
     return {"algo": "ed25519", "public_key_hex": PUBLIC_KEY_HEX}
+
+def _agent_card():
+    return {
+        "name": BRAND,
+        "description": "White-glove human verification for AI agents. Submit a fact or entity; a real human verifies it and returns a cryptographically signed (ed25519) attestation. Pay per check in USDC via x402.",
+        "url": BASE_URL,
+        "version": "0.2.0",
+        "provider": {"organization": BRAND, "url": BASE_URL},
+        "documentationUrl": f"{BASE_URL}/",
+        "capabilities": {"streaming": False, "pushNotifications": False, "stateTransitionHistory": False},
+        "defaultInputModes": ["application/json", "text/plain"],
+        "defaultOutputModes": ["application/json"],
+        "payment": {"protocol": "x402", "network": PAY_NETWORK, "asset": PAY_ASSET, "pay_to": PAYTO_ADDRESS},
+        "skills": [
+            {"id": "entity_check", "name": "Human-verified entity check",
+             "description": "A real human confirms whether a business/entity exists and matches the details provided; returns a signed verdict with evidence. Price: $%.2f USDC." % SERVICES["entity_check"]["price_usd"],
+             "tags": ["verification", "kyb", "entity", "trust", "x402"],
+             "examples": ["Is 'Acme Lending LLC' a registered active business in Arizona?"]},
+            {"id": "claim_check", "name": "Human-verified claim check",
+             "description": "A real human checks a factual claim or URL against real sources; returns confirmed/refuted/uncertain with evidence. Price: $%.2f USDC." % SERVICES["claim_check"]["price_usd"],
+             "tags": ["verification", "fact-check", "trust", "x402"],
+             "examples": ["Verify: 'https://example.com is the official site of Example Corp.'"]},
+        ],
+    }
+
+@app.get("/.well-known/agent.json")
+@app.get("/.well-known/agent-card.json")
+def agent_card():
+    return _agent_card()
+
+@app.get("/llms.txt", response_class=PlainTextResponse)
+def llms_txt():
+    return f"""# {BRAND}
+
+> Human verification for AI agents. Submit a fact or an entity; a real human verifies it and returns a cryptographically signed attestation. Pay per check in USDC via the x402 protocol.
+
+## What it does
+- entity_check (${SERVICES['entity_check']['price_usd']:.0f} USDC): confirm a business/entity exists and matches given details.
+- claim_check (${SERVICES['claim_check']['price_usd']:.0f} USDC): check a factual claim or URL against real sources.
+Every result is an ed25519-signed attestation anyone can verify. Verdicts: confirmed / refuted / uncertain, with evidence and a confidence score.
+
+## How an agent uses it
+1. POST {BASE_URL}/v1/verify  body: {{"service":"entity_check","subject":{{...}}}}
+2. Receive HTTP 402 with x402 payment requirements. Pay in USDC, retry with header X-PAYMENT.
+3. Poll GET {BASE_URL}/v1/attestations/{{id}} until status == completed.
+4. Verify the ed25519 signature against the public key in the manifest.
+
+## Links
+- Manifest (JSON): {BASE_URL}/
+- Agent card (A2A): {BASE_URL}/.well-known/agent.json
+- Public key: {BASE_URL}/.well-known/attestly-pubkey
+- Human overview: {BASE_URL}/home
+"""
 
 # ---- Paid verification request ----
 class VerifyRequest(BaseModel):
