@@ -50,6 +50,9 @@ BASE_URL       = os.environ.get("BASE_URL", "http://localhost:8000")
 FACILITATOR_URL = os.environ.get("FACILITATOR_URL", "").rstrip("/")   # e.g. https://x402.org/facilitator
 ALLOW_UNVERIFIED = os.environ.get("ALLOW_UNVERIFIED_PAYMENTS", "true").lower() == "true"
 CONTACT_EMAIL  = os.environ.get("CONTACT_EMAIL", "you@yourdomain.com")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")             # email alerts on new jobs
+ALERT_EMAIL    = os.environ.get("ALERT_EMAIL", "jason@theleadforge.com")
+ALERT_FROM     = os.environ.get("ALERT_FROM", "Attestly <onboarding@resend.dev>")
 
 SERVICES = {
     "entity_check": {
@@ -159,6 +162,23 @@ def check_payment(proof: str | None, service_key: str) -> tuple[bool, str]:
 # ----------------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------------
+def notify_new_job(att_id: str, service: str) -> None:
+    """Fire-and-forget email alert via Resend. Never breaks the request if email fails."""
+    if not RESEND_API_KEY:
+        return
+    try:
+        httpx.post("https://api.resend.com/emails",
+                   headers={"Authorization": "Bearer " + RESEND_API_KEY, "Content-Type": "application/json"},
+                   json={"from": ALERT_FROM, "to": [ALERT_EMAIL],
+                         "subject": f"Attestly 💰 new {service} job",
+                         "text": f"You have a new {service} request.\n\n"
+                                 f"Job id: {att_id}\n\n"
+                                 f"Next step: open {BASE_URL}/admin, verify it against sources, then Sign & publish.\n"
+                                 f"(Confirm the USDC landed in your wallet first.)"},
+                   timeout=8)
+    except Exception:
+        pass
+
 app = FastAPI(title=BRAND, version="0.2.0")
 
 @app.get("/healthz")
@@ -205,6 +225,7 @@ def verify(req: VerifyRequest, x_payment: str | None = Header(default=None)):
                      (att_id, req.service, json.dumps(req.subject), "pending",
                       (x_payment or "")[:80], pay_status, now_iso()))
         conn.commit()
+    notify_new_job(att_id, req.service)
     return {"attestation_id": att_id, "status": "pending", "payment_status": pay_status,
             "status_url": f"{BASE_URL}/v1/attestations/{att_id}",
             "public_url": f"{BASE_URL}/a/{att_id}",
@@ -238,6 +259,22 @@ class CompleteRequest(BaseModel):
 def require_admin(token: str | None):
     if token != ADMIN_TOKEN:
         raise HTTPException(401, "bad admin token")
+
+@app.get("/admin/stats")
+def admin_stats(x_admin_token: str | None = Header(default=None)):
+    require_admin(x_admin_token)
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT service, status FROM attestations").fetchall()
+    total = len(rows)
+    pending = sum(1 for r in rows if r["status"] == "pending")
+    completed = sum(1 for r in rows if r["status"] == "completed")
+    revenue = round(sum(SERVICES.get(r["service"], {}).get("price_usd", 0)
+                        for r in rows if r["status"] == "completed"), 2)
+    by_service = {}
+    for r in rows:
+        by_service[r["service"]] = by_service.get(r["service"], 0) + 1
+    return {"total_jobs": total, "pending": pending, "completed": completed,
+            "revenue_usd": revenue, "by_service": by_service}
 
 @app.get("/admin/pending")
 def admin_pending(x_admin_token: str | None = Header(default=None)):
@@ -344,11 +381,21 @@ def admin_console():
   <button onclick=load() style="padding:8px 14px">Load pending</button>
   <span id=msg style="margin-left:10px;color:#666"></span>
 </div>
+<div id=stats style="display:flex;gap:12px;flex-wrap:wrap;margin:10px 0"></div>
 <div id=list></div>
 <script>
 const H=()=>({'X-ADMIN-TOKEN':document.getElementById('tok').value,'content-type':'application/json'});
+function tile(label,val){return `<div style="border:1px solid #e5e5e5;border-radius:10px;padding:12px 16px;min-width:110px"><div style="font-size:22px;font-weight:700;color:#2F5496">${val}</div><div style="font-size:12px;color:#666">${label}</div></div>`;}
+async function loadStats(){
+  const r=await fetch('/admin/stats',{headers:H()});
+  if(!r.ok)return;
+  const s=await r.json();
+  document.getElementById('stats').innerHTML=
+    tile('Total jobs',s.total_jobs)+tile('Pending',s.pending)+tile('Completed',s.completed)+tile('Revenue','$'+s.revenue_usd);
+}
 async function load(){
   document.getElementById('msg').textContent='loading...';
+  loadStats();
   const r=await fetch('/admin/pending',{headers:H()});
   if(!r.ok){document.getElementById('msg').textContent='error '+r.status;return;}
   const jobs=await r.json();

@@ -31,3 +31,7 @@ services:
         value: "true"
       - key: FACILITATOR_URL
         value: ""
+      - key: RESEND_API_KEY
+        sync: false        # set in the Render dashboard (email alerts)
+      - key: ALERT_EMAIL
+        value: jason@theleadforge.com
