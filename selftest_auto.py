@@ -85,12 +85,34 @@ with TestClient(A.app) as c:
     check("wallet_screen has risk_level + sanctioned", set(["sanctioned", "risk_level", "flags"]).issubset(w.get("data", {}).keys()))
     check("wallet_screen signature verifies", bool(verify_sig(w["attestation_id"])))
 
+    # --- agent_verify: input validation, structure, signature ---
+    r = c.post("/v1/verify", json={"service": "agent_verify", "subject": {"agent": ""}}, headers=PAY)
+    check("agent_verify rejects empty agent -> 400", r.status_code == 400)
+
+    r = c.post("/v1/verify", json={"service": "agent_verify", "subject": {"agent": "no-such-domain-xyz-9999.invalid"}}, headers=PAY)
+    check("agent_verify unknown domain -> refuted", r.status_code == 200 and r.json().get("verdict") == "refuted")
+    av = r.json()
+    check("agent_verify data has identity fields",
+          set(["card_found", "resolves", "tls_valid", "host_match", "key_verified"]).issubset(av.get("data", {}).keys()))
+    check("agent_verify signature verifies", bool(verify_sig(av["attestation_id"])))
+
+    # --- agent_verify key control: a valid ed25519 signature proves key control ---
+    from nacl.signing import SigningKey as _SK
+    _k = _SK.generate(); _pk = _k.verify_key.encode(encoder=HexEncoder).decode()
+    _sig = _k.sign(b"prove-it").signature.hex()
+    r = c.post("/v1/verify", json={"service": "agent_verify", "subject": {
+        "agent": "no-such-domain-xyz-9999.invalid", "public_key": _pk, "message": "prove-it", "signature": _sig}}, headers=PAY)
+    check("agent_verify recognizes valid key control", r.json().get("data", {}).get("key_verified") is True)
+    r = c.post("/v1/verify", json={"service": "agent_verify", "subject": {
+        "agent": "no-such-domain-xyz-9999.invalid", "public_key": _pk, "message": "prove-it", "signature": "00"*64}}, headers=PAY)
+    check("agent_verify catches bad signature", r.json().get("data", {}).get("key_verified") is False)
+
     # --- MCP tools registered ---
     import asyncio
     tools = asyncio.run(A._mcp.list_tools())
     names = set(t.name for t in tools)
-    check("MCP tools include 4 auto + human tools",
-          {"notarize", "domain_check", "email_check", "wallet_screen", "request_verification", "get_services"}.issubset(names))
+    check("MCP tools include auto + human tools",
+          {"notarize", "domain_check", "email_check", "wallet_screen", "agent_verify", "request_verification", "get_services"}.issubset(names))
 
     # --- manifest + llms.txt + agent card reflect all 6 services ---
     man = c.get("/").json()

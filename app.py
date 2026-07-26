@@ -40,7 +40,7 @@ from fastmcp import FastMCP
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
-from nacl.signing import SigningKey
+from nacl.signing import SigningKey, VerifyKey
 from nacl.encoding import HexEncoder
 
 # ----------------------------------------------------------------------------
@@ -198,6 +198,11 @@ SERVICES = {
         "title": "Crypto wallet risk & sanctions screening",
         "description": "Instant automated screen of an EVM address against OFAC sanctions + on-chain activity. Know your counterparty before you pay.",
         "price_usd": 1.00, "auto": True,
+    },
+    "agent_verify": {
+        "title": "Agent identity verification",
+        "description": "Instantly verify another agent is who it claims: fetches and validates its A2A agent card, confirms domain control (DNS/TLS/host match), and optionally verifies ed25519 key control via a signed message. Know your counterparty agent before you trust or transact.",
+        "price_usd": 0.75, "auto": True,
     },
 }
 
@@ -590,11 +595,109 @@ def run_wallet_screen(subject: dict):
                 {"label": "age", "note": f"first_tx={first_tx}, age_days={age_days}"}]
     return (verdict, conf, summary, evidence, data, {"address": addr, "network": network})
 
+def run_agent_verify(subject: dict):
+    """Verify another agent's identity: valid A2A agent card + domain control + optional key control."""
+    agent = (subject.get("agent") or "").strip()
+    if not agent:
+        raise ValueError("provide 'agent' — a domain (example.com) or a full agent-card URL")
+    expected_name = (subject.get("expected_name") or "").strip()
+    pub = (subject.get("public_key") or "").strip()
+    msg = subject.get("message")
+    sig = (subject.get("signature") or "").strip()
+
+    # Candidate agent-card URLs.
+    candidates = []
+    if agent.startswith("http"):
+        candidates.append(agent)
+        m = re.match(r"(https?://[^/]+)", agent)
+        if m:
+            candidates += [m.group(1) + "/.well-known/agent.json", m.group(1) + "/.well-known/agent-card.json"]
+        host = re.sub(r"^https?://", "", agent).split("/")[0]
+    else:
+        host = re.sub(r"^https?://", "", agent).split("/")[0].split(":")[0]
+        candidates += [f"https://{host}/.well-known/agent.json", f"https://{host}/.well-known/agent-card.json"]
+
+    card = card_url = None
+    for u in candidates:
+        try:
+            r = httpx.get(u, timeout=8, follow_redirects=True)
+            if r.status_code == 200:
+                j = r.json()
+                if isinstance(j, dict) and (j.get("name") or j.get("skills") or j.get("protocolVersion")):
+                    card, card_url = j, u
+                    break
+        except Exception:
+            continue
+
+    card_found = card is not None
+    card_name = (card or {}).get("name")
+    protocol_version = (card or {}).get("protocolVersion")
+    card_url_field = (card or {}).get("url") or ((card or {}).get("provider") or {}).get("url")
+    url_host = re.sub(r"^https?://", "", card_url_field).split("/")[0].split(":")[0] if card_url_field else None
+
+    # Domain resolves + TLS valid (reuse the same signals as domain_check).
+    resolves = ssl_valid = False
+    check_host = url_host or host
+    try:
+        dns.resolver.resolve(check_host, "A", lifetime=5); resolves = True
+    except Exception: pass
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((check_host, 443), timeout=6) as s:
+            with ctx.wrap_socket(s, server_hostname=check_host) as ss:
+                ss.getpeercert(); ssl_valid = True
+    except Exception: pass
+
+    host_match = (url_host is None) or (url_host == host) or (host in (url_host or "")) or ((url_host or "") in host)
+    name_match = (not expected_name) or (expected_name.lower() == (card_name or "").lower())
+
+    # Optional cryptographic key control.
+    key_verified = None
+    if pub and sig and msg is not None:
+        try:
+            VerifyKey(pub, encoder=HexEncoder).verify(str(msg).encode(), bytes.fromhex(sig))
+            key_verified = True
+        except Exception:
+            key_verified = False
+
+    flags = []
+    if not card_found: flags.append("no valid agent card found")
+    if not resolves: flags.append("domain does not resolve")
+    if not ssl_valid: flags.append("no/invalid TLS")
+    if not host_match: flags.append("card url host != queried domain")
+    if not name_match: flags.append("name mismatch")
+    if key_verified is False: flags.append("signature invalid")
+    if key_verified is True: flags.append("key control proven")
+
+    if not card_found or not resolves or not host_match or not name_match or key_verified is False:
+        verdict, conf = "refuted", 90
+    elif ssl_valid and (key_verified is True or key_verified is None):
+        verdict, conf = ("confirmed", 92 if key_verified else 80)
+        if key_verified is None:
+            flags.append("identity consistent; key control not proven (no signature provided)")
+    else:
+        verdict, conf = "uncertain", 60
+
+    summary = (f"{check_host}: card={'found' if card_found else 'missing'}"
+               + (f" ('{card_name}')" if card_name else "")
+               + f", resolves={resolves}, TLS={'valid' if ssl_valid else 'no'}, host_match={host_match}"
+               + (f", key_verified={key_verified}" if key_verified is not None else "")
+               + f" → {verdict}.")
+    data = {"agent": agent, "card_url": card_url, "card_found": card_found, "card_name": card_name,
+            "protocol_version": protocol_version, "card_url_host": url_host, "resolves": resolves,
+            "tls_valid": ssl_valid, "host_match": host_match, "name_match": name_match,
+            "key_verified": key_verified, "flags": flags}
+    evidence = [{"label": "agent_card", "note": f"found={card_found} at {card_url}"},
+                {"label": "domain", "note": f"host={check_host}, resolves={resolves}, tls={ssl_valid}"},
+                {"label": "key_control", "note": f"verified={key_verified}"}]
+    return (verdict, conf, summary, evidence, data, {"agent": agent, "expected_name": expected_name or None})
+
 AUTO_RUNNERS = {
     "notarize": run_notarize,
     "domain_check": run_domain_check,
     "email_check": run_email_check,
     "wallet_screen": run_wallet_screen,
+    "agent_verify": run_agent_verify,
 }
 
 def run_auto(service: str, subject: dict, payment_status: str = "auto", payment_ref: str | None = None) -> dict:
@@ -698,6 +801,17 @@ def wallet_screen(address: str, network: str = "base", payment: str = "") -> dic
     Informational screening only — NOT compliance, legal, or financial advice, and not 'KYC-certified'."""
     return _auto_tool("wallet_screen", {"address": address, "network": network}, payment)
 
+@_mcp.tool
+def agent_verify(agent: str, public_key: str = "", message: str = "", signature: str = "",
+                 expected_name: str = "", payment: str = "") -> dict:
+    """Instantly verify another agent's identity before you trust or transact with it. 0.75 USDC.
+    agent: the other agent's domain (example.com) or full agent-card URL.
+    Checks its A2A agent card is valid, that it controls the claimed domain (DNS/TLS/host match), and — if you pass
+    public_key + message + signature — cryptographically verifies it controls its key. expected_name: optional name to match.
+    Returns a signed verdict (confirmed/refuted/uncertain) with evidence. payment: your x402 proof; omit to get requirements first."""
+    return _auto_tool("agent_verify", {"agent": agent, "public_key": public_key, "message": message,
+                                       "signature": signature, "expected_name": expected_name}, payment)
+
 _mcp_app = _mcp.http_app(path="/mcp")   # internal route is exactly /mcp (no trailing-slash redirect)
 
 app = FastAPI(title=BRAND, version="0.2.0", lifespan=_mcp_app.lifespan)
@@ -789,6 +903,10 @@ def _agent_card():
              "description": "Instantly notarize content or a hash — an ed25519-signed proof it existed at time T. Proves existence, not authorship. FREE (no payment) — the easiest way to try Attestly.",
              "tags": ["notary", "timestamp", "hash", "proof", "x402", "instant", "free"],
              "examples": ["Notarize the SHA-256 of this agreement text."]},
+            {"id": "agent-verify", "name": "Agent identity verification (instant)",
+             "description": "Instantly verify another agent is who it claims: validates its A2A agent card, confirms domain control (DNS/TLS/host match), and optionally verifies ed25519 key control via a signed message. Know your counterparty agent before you trust or transact. Price: %.2f USDC." % SERVICES["agent_verify"]["price_usd"],
+             "tags": ["verification", "agent", "identity", "a2a", "trust", "x402", "instant"],
+             "examples": ["Verify the agent at partner-agent.com is legitimate before I delegate to it."]},
         ],
         "pricing": pricing_policy(),
     }
@@ -806,6 +924,7 @@ def llms_txt():
 
 ## Instant automated checks (signed result in the same response)
 - wallet_screen (${SERVICES['wallet_screen']['price_usd']:.2f} USDC): screen an EVM address vs OFAC sanctions + on-chain activity before you pay a counterparty. Informational, not compliance advice.
+- agent_verify (${SERVICES['agent_verify']['price_usd']:.2f} USDC): verify another agent is who it claims — validates its A2A agent card, domain control (DNS/TLS), and optional ed25519 key control. Know your counterparty agent before you trust or transact.
 - domain_check (${SERVICES['domain_check']['price_usd']:.2f} USDC): does a domain resolve, valid TLS, age, registrar, reachability.
 - email_check (${SERVICES['email_check']['price_usd']:.2f} USDC): syntax, MX records, disposable-domain detection, deliverability signal.
 - notarize (FREE): signed proof that content (or its hash) existed at time T. Existence, not authorship. No payment required — the easiest way to try Attestly.
@@ -822,7 +941,7 @@ Introductory pricing ({PRICING_STATUS}, v{PRICING_VERSION}): intentionally low w
 2. Receive HTTP 402 with x402 payment requirements (free services skip this). Pay in USDC, retry with header X-PAYMENT.
 3. Automated services return the signed, completed attestation immediately. Human services return a job id — poll GET {BASE_URL}/v1/attestations/{{id}} until status == completed.
 4. Verify the ed25519 signature against the public key in the manifest.
-Or call the hosted MCP server at {BASE_URL}/mcp (tools: wallet_screen, domain_check, email_check, notarize, request_verification, get_attestation, get_services).
+Or call the hosted MCP server at {BASE_URL}/mcp (tools: wallet_screen, agent_verify, domain_check, email_check, notarize, request_verification, get_attestation, get_services).
 
 ## Links
 - Pricing (JSON): {BASE_URL}/pricing
