@@ -731,10 +731,11 @@ def public_page(att_id: str):
         url = e.get("url"); link = f'<a href="{url}">{url}</a>' if url else ""
         return f"<li>{e.get('label','')} — {link} {e.get('note','')}</li>"
     ev_html = "".join(ev_line(e) for e in evidence) or "<li>(none)</li>"
-    color = {"confirmed": "#0a7d2c", "refuted": "#b00020", "uncertain": "#8a6d00"}.get(row["verdict"], "#333")
+    color = {"confirmed": "#0a7d2c", "refuted": "#b00020", "uncertain": "#8a6d00", "notarized": "#0a7d2c"}.get(row["verdict"], "#333")
+    kind = "Automated signed check" if SERVICES.get(row["service"], {}).get("auto") else "Human-verified attestation"
     return HTMLResponse(f"""<!doctype html><meta charset=utf-8><title>{BRAND} attestation {att_id}</title>
     <body style="font-family:system-ui;max-width:720px;margin:48px auto;color:#1a1a1a;line-height:1.5">
-      <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#666">{BRAND} · Human-verified attestation</div>
+      <div style="font-size:13px;letter-spacing:.08em;text-transform:uppercase;color:#666">{BRAND} · {kind}</div>
       <h1 style="margin:.2em 0">Verdict: <span style="color:{color};text-transform:capitalize">{row['verdict']}</span>
         <span style="font-size:16px;color:#666">({row['confidence']}% confidence)</span></h1>
       <p style="font-size:18px">{row['summary']}</p>
