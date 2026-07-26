@@ -337,12 +337,15 @@ def check_payment(proof: str | None, service_key: str) -> tuple[bool, str, str |
                 reqs = _payment_requirements(service_key)
                 v = _facilitator().verify(payload, reqs)
                 if not getattr(v, "is_valid", False):
+                    notify_payment_problem(service_key, "verify_rejected")
                     return (False, "rejected", None)
                 s = _facilitator().settle(payload, reqs)
                 if getattr(s, "success", False):
                     return (True, "verified", getattr(s, "transaction", None))
+                notify_payment_problem(service_key, "settle_failed")
                 return (False, "settle_failed", None)
             except Exception:
+                notify_payment_problem(service_key, "facilitator_error")
                 if ALLOW_UNVERIFIED:
                     return (True, "unverified_manual", None)
                 return (False, "facilitator_error", None)
@@ -354,22 +357,38 @@ def check_payment(proof: str | None, service_key: str) -> tuple[bool, str, str |
 # ----------------------------------------------------------------------------
 # App
 # ----------------------------------------------------------------------------
-def notify_new_job(att_id: str, service: str) -> None:
+def _send_email(subject: str, text: str) -> None:
     """Fire-and-forget email alert via Resend. Never breaks the request if email fails."""
     if not RESEND_API_KEY:
         return
     try:
         httpx.post("https://api.resend.com/emails",
                    headers={"Authorization": "Bearer " + RESEND_API_KEY, "Content-Type": "application/json"},
-                   json={"from": ALERT_FROM, "to": [ALERT_EMAIL],
-                         "subject": f"Attestly 💰 new {service} job",
-                         "text": f"You have a new {service} request.\n\n"
-                                 f"Job id: {att_id}\n\n"
-                                 f"Next step: open {BASE_URL}/admin, verify it against sources, then Sign & publish.\n"
-                                 f"(Confirm the USDC landed in your wallet first.)"},
+                   json={"from": ALERT_FROM, "to": [ALERT_EMAIL], "subject": subject, "text": text},
                    timeout=8)
     except Exception:
         pass
+
+def notify_new_job(att_id: str, service: str) -> None:
+    _send_email(f"Attestly 💰 new {service} job",
+                f"You have a new {service} request.\n\nJob id: {att_id}\n\n"
+                f"Next step: open {BASE_URL}/admin, verify it against sources, then Sign & publish.\n"
+                f"(Confirm the USDC landed in your wallet first.)")
+
+def notify_paid(att_id: str, service: str, tx_ref: str | None) -> None:
+    """A real x402 payment settled on-chain. This is real money."""
+    price = SERVICES.get(service, {}).get("price_usd", 0)
+    _send_email(f"Attestly 💰💰 REAL PAYMENT — {service} (${price:.2f})",
+                f"A real payment just settled on-chain.\n\nService: {service}\nAmount: ${price:.2f} USDC\n"
+                f"Job id: {att_id}\nTx: {tx_ref or '(see wallet)'}\n\n"
+                f"Check your Base wallet and {BASE_URL}/admin (Load all jobs).")
+
+def notify_payment_problem(service: str, status: str) -> None:
+    """A real x402 payment was attempted but did not settle cleanly — investigate."""
+    _send_email(f"Attestly ⚠️ payment attempt did NOT settle — {service} ({status})",
+                f"An agent attempted to pay for '{service}' but it did not settle cleanly (status: {status}).\n\n"
+                f"This may mean a payment-format/version mismatch. The check was NOT served for real money.\n"
+                f"Investigate {BASE_URL}/admin/facilitator and the facilitator logs. First real payment = expected test point.")
 
 # ----------------------------------------------------------------------------
 # Automated checks (no human) — run synchronously, sign, return completed.
@@ -393,6 +412,8 @@ def finalize_auto(service: str, subject: dict, verdict: str, confidence: int,
         sig = SIGNING_KEY.sign(canonical_payload(row).encode(), encoder=HexEncoder).signature.decode()
         conn.execute("UPDATE attestations SET signature=? WHERE id=?", (sig, att_id))
         conn.commit()
+    if payment_status == "verified":
+        notify_paid(att_id, service, payment_ref)   # real money settled
     return {"attestation_id": att_id, "status": "completed", "verdict": verdict,
             "confidence": confidence, "summary": summary, "evidence": evidence,
             "data": data or {}, "signature": sig, "public_key": PUBLIC_KEY_HEX,
@@ -614,6 +635,8 @@ def request_verification(service: str, subject: dict, payment: str = "") -> dict
                      (att_id, service, json.dumps(subject), "pending", (tx_ref or (payment or "")[:80]), pay_status, now_iso()))
         conn.commit()
     notify_new_job(att_id, service)
+    if pay_status == "verified":
+        notify_paid(att_id, service, tx_ref)
     return {"attestation_id": att_id, "status": "pending",
             "status_url": f"{BASE_URL}/v1/attestations/{att_id}", "public_url": f"{BASE_URL}/a/{att_id}"}
 
@@ -834,6 +857,8 @@ def verify(req: VerifyRequest, x_payment: str | None = Header(default=None)):
                       (tx_ref or (x_payment or "")[:80]), pay_status, now_iso()))
         conn.commit()
     notify_new_job(att_id, req.service)
+    if pay_status == "verified":
+        notify_paid(att_id, req.service, tx_ref)
     return {"attestation_id": att_id, "status": "pending", "payment_status": pay_status,
             "status_url": f"{BASE_URL}/v1/attestations/{att_id}",
             "public_url": f"{BASE_URL}/a/{att_id}",
