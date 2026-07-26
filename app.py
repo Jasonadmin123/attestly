@@ -76,7 +76,7 @@ _X402_OK = False
 _X402_ASSET = None
 try:
     from x402.mechanisms.evm.constants import NETWORK_CONFIGS as _NETCFG
-    from x402.http import (FacilitatorClientSync as _FacClient,
+    from x402.http import (HTTPFacilitatorClientSync as _FacClient,
                            FacilitatorConfig as _FacConfig,
                            CreateHeadersAuthProvider as _AuthProvider,
                            safe_base64_decode as _b64d)
