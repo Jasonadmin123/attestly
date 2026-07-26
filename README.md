@@ -52,15 +52,27 @@ The service is machine-discoverable at:
 Register the A2A card at a2a-registry.org and agenstry.com. Add the repo to
 awesome-x402 (github.com/xpaysh/awesome-x402).
 
-## MCP server (list on MCP registries)
-`mcp_server.py` exposes Attestly as MCP tools (`get_services`, `request_verification`,
-`get_attestation`) so any MCP-capable agent can call it.
+## MCP server — hosted + local
+Attestly is callable as an MCP server with tools `get_services`, `request_verification`,
+`get_attestation`.
+
+**Hosted (recommended — no install):** connect any MCP client to
+```
+https://attestly.co/mcp
+```
+(Streamable HTTP transport.)
+
+**Local (stdio):**
 ```bash
 pip install mcp httpx
-python mcp_server.py          # stdio transport
+python mcp_server.py
+```
+MCP client config example:
+```json
+{ "mcpServers": { "attestly": { "url": "https://attestly.co/mcp" } } }
 ```
 List it on the MCP registries (Smithery, Glama, PulseMCP, mcp.so, official MCP Registry) —
-most accept a GitHub repo or a hosted URL.
+they accept the hosted URL above and/or this public repo.
 
 ## Stay out of regulation
 Verify facts and entities only. No legal/medical/financial **advice**, no handling other

@@ -30,6 +30,7 @@ from datetime import datetime, timezone
 from contextlib import closing
 
 import httpx
+from fastmcp import FastMCP
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
@@ -179,7 +180,62 @@ def notify_new_job(att_id: str, service: str) -> None:
     except Exception:
         pass
 
-app = FastAPI(title=BRAND, version="0.2.0")
+# ----------------------------------------------------------------------------
+# Hosted MCP server (remote, callable at /mcp) — so any MCP agent can use Attestly
+# by URL, no install. Tools reuse the internal logic below.
+# ----------------------------------------------------------------------------
+_mcp = FastMCP("Attestly")
+
+@_mcp.tool
+def get_services() -> dict:
+    """List Attestly's verification services, prices (USDC), and how payment works."""
+    return {"services": SERVICES,
+            "payment": {"protocol": "x402", "network": PAY_NETWORK, "asset": PAY_ASSET, "pay_to": PAYTO_ADDRESS}}
+
+@_mcp.tool
+def request_verification(service: str, subject: dict, payment: str = "") -> dict:
+    """Ask a real human to verify a fact or an entity, returned as a signed attestation.
+    service: 'entity_check' (does this business/entity exist & match?) or 'claim_check' (is this claim/URL true?).
+    subject: what to verify, e.g. {"business":"Acme LLC","state":"AZ","claim":"is registered"}.
+    payment: your x402 payment proof. Omit to first receive payment requirements, then pay and call again."""
+    if service not in SERVICES:
+        return {"error": f"unknown service '{service}'. Use get_services()."}
+    accepted, pay_status = check_payment(payment or None, service)
+    if not accepted:
+        svc = SERVICES[service]
+        return {"payment_required": {"protocol": "x402", "network": PAY_NETWORK, "asset": PAY_ASSET,
+                                     "amount": f"{svc['price_usd']:.2f}", "payTo": PAYTO_ADDRESS},
+                "note": "Pay the amount in USDC, then call request_verification again with the payment proof."}
+    att_id = "at_" + secrets.token_hex(8)
+    with closing(db()) as conn:
+        conn.execute("INSERT INTO attestations (id,service,subject,status,payment_ref,payment_status,created_at) VALUES (?,?,?,?,?,?,?)",
+                     (att_id, service, json.dumps(subject), "pending", (payment or "")[:80], pay_status, now_iso()))
+        conn.commit()
+    notify_new_job(att_id, service)
+    return {"attestation_id": att_id, "status": "pending",
+            "status_url": f"{BASE_URL}/v1/attestations/{att_id}", "public_url": f"{BASE_URL}/a/{att_id}"}
+
+@_mcp.tool
+def get_attestation(attestation_id: str) -> dict:
+    """Fetch an attestation by id: status, and (when completed) the signed verdict, evidence,
+    confidence, signature, and public key so you can verify it yourself."""
+    with closing(db()) as conn:
+        row = conn.execute("SELECT * FROM attestations WHERE id=?", (attestation_id,)).fetchone()
+    if not row:
+        return {"error": "not found"}
+    out = {"id": row["id"], "service": row["service"], "subject": json.loads(row["subject"]),
+           "status": row["status"], "created_at": row["created_at"]}
+    if row["status"] == "completed":
+        out.update({"verdict": row["verdict"], "summary": row["summary"],
+                    "evidence": json.loads(row["evidence"] or "[]"), "confidence": row["confidence"],
+                    "issued_at": row["completed_at"], "issuer": row["issuer"],
+                    "signature": row["signature"], "public_key": PUBLIC_KEY_HEX})
+    return out
+
+_mcp_app = _mcp.http_app(path="/")
+
+app = FastAPI(title=BRAND, version="0.2.0", lifespan=_mcp_app.lifespan)
+app.mount("/mcp", _mcp_app)
 
 @app.get("/healthz")
 def healthz():
