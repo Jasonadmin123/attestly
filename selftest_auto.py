@@ -26,9 +26,12 @@ def verify_sig(att_id):
     return full
 
 with TestClient(A.app) as c:
-    # --- payment gating: automated service returns 402 without payment ---
-    r = c.post("/v1/verify", json={"service": "notarize", "subject": {"content": "hello"}})
-    check("auto service -> 402 without payment", r.status_code == 402)
+    # --- payment gating: PAID automated service returns 402 without payment ---
+    r = c.post("/v1/verify", json={"service": "wallet_screen", "subject": {"address": "0x" + "a"*40}})
+    check("paid auto service -> 402 without payment", r.status_code == 402)
+    # --- free service (notarize) completes with NO payment ---
+    r = c.post("/v1/verify", json={"service": "notarize", "subject": {"content": "free-check"}})
+    check("free notarize -> 200 without payment", r.status_code == 200 and r.json().get("status") == "completed")
 
     # --- notarize: deterministic, verify hash + signature ---
     content = "The quick brown fox."

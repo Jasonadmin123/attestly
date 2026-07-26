@@ -57,6 +57,11 @@ BASE_URL       = os.environ.get("BASE_URL", "http://localhost:8000")
 FACILITATOR_URL = os.environ.get("FACILITATOR_URL", "").rstrip("/")   # override; else derived from network
 ALLOW_UNVERIFIED = os.environ.get("ALLOW_UNVERIFIED_PAYMENTS", "true").lower() == "true"
 CONTACT_EMAIL  = os.environ.get("CONTACT_EMAIL", "you@yourdomain.com")
+# Pricing policy (machine-readable, surfaced to agent customers).
+PRICING_VERSION = os.environ.get("PRICING_VERSION", "2026.07")
+PRICING_STATUS  = os.environ.get("PRICING_STATUS", "introductory")
+PRICE_CHANGE_NOTICE_DAYS = int(os.environ.get("PRICE_CHANGE_NOTICE_DAYS", "14"))
+PRICING_EFFECTIVE_DATE   = os.environ.get("PRICING_EFFECTIVE_DATE") or None  # set when a change is scheduled
 
 # --- x402 facilitator (real payments) -------------------------------------
 # CAIP-2 network. Default Base mainnet; set eip155:84532 for Base Sepolia testnet dry-runs.
@@ -175,8 +180,8 @@ SERVICES = {
     },
     "notarize": {
         "title": "Content notarization (signed timestamp)",
-        "description": "Submit content or a SHA-256 hash; get an instant ed25519-signed proof it existed at this time.",
-        "price_usd": 0.50, "auto": True,
+        "description": "Submit content or a SHA-256 hash; get an instant ed25519-signed proof it existed at this time. Free — try Attestly with no payment.",
+        "price_usd": 0.00, "auto": True, "free": True,
     },
     "domain_check": {
         "title": "Domain & website verification",
@@ -194,6 +199,40 @@ SERVICES = {
         "price_usd": 1.00, "auto": True,
     },
 }
+
+def pricing_notice(service_key: str | None = None) -> str:
+    if service_key and SERVICES.get(service_key, {}).get("price_usd", 0) <= 0:
+        return (f"This service is FREE during Attestly's introductory period (v{PRICING_VERSION}). "
+                f"Paid services will rise as the service matures; ≥{PRICE_CHANGE_NOTICE_DAYS}d notice before any change. See {BASE_URL}/pricing.")
+    return (f"Introductory pricing (v{PRICING_VERSION}) — intentionally low to build a track record; prices will rise "
+            f"as the service matures. The price quoted at request time is locked for that request, with ≥{PRICE_CHANGE_NOTICE_DAYS} "
+            f"days' machine-readable notice before any change (poll {BASE_URL}/pricing; watch pricing.version).")
+
+def pricing_policy() -> dict:
+    """Machine-readable pricing terms for agent customers. Honest + actionable:
+    introductory pricing now, will rise as the service matures, with guarantees an agent can rely on."""
+    return {
+        "version": PRICING_VERSION,
+        "status": PRICING_STATUS,   # "introductory" -> "standard" later
+        "currency": PAY_ASSET,
+        "network": PAY_NETWORK_CAIP,
+        "notice": ("Introductory pricing: intentionally low while Attestly builds a track record with "
+                   "early agents. Prices will increase as the service matures. Any change is published here "
+                   f"with an effective_date at least {PRICE_CHANGE_NOTICE_DAYS} days before it applies — "
+                   "compare pricing.version to detect changes. Integrating now locks in today's rates under "
+                   "the guarantees below."),
+        "free_services": [k for k, v in SERVICES.items() if v.get("price_usd", 0) <= 0],
+        "services": {k: {"price_usd": v["price_usd"], "free": v.get("price_usd", 0) <= 0,
+                         "type": "automated" if v.get("auto") else "human"}
+                     for k, v in SERVICES.items()},
+        "guarantees": {
+            "price_lock": "The price quoted in the 402 challenge at request time is honored for that request; changes never apply retroactively.",
+            "advance_notice_days": PRICE_CHANGE_NOTICE_DAYS,
+            "detect_changes": "pricing.version bumps on any change; poll GET /pricing.",
+        },
+        "effective_date": PRICING_EFFECTIVE_DATE,   # non-null only when a change is scheduled
+        "terms_url": f"{BASE_URL}/pricing",
+    }
 
 # ----------------------------------------------------------------------------
 # Signing key
@@ -267,6 +306,8 @@ def x402_challenge(service_key: str) -> JSONResponse:
         "x402Version": 2 if _X402_OK else 1, "error": "payment_required",
         "accepts": accepts,
         "note": "Pay the amount above in USDC, then retry with header 'X-PAYMENT: <payload>'.",
+        "pricing_notice": pricing_notice(service_key),
+        "pricing_url": f"{BASE_URL}/pricing",
     })
 
 def check_payment(proof: str | None, service_key: str) -> tuple[bool, str, str | None]:
@@ -279,6 +320,9 @@ def check_payment(proof: str | None, service_key: str) -> tuple[bool, str, str |
          mode is on, accept it flagged 'unverified_manual' so YOU reconcile by hand.
       3. Otherwise reject.
     """
+    # Free services (price 0) never require payment — the cheap on-ramp.
+    if SERVICES.get(service_key, {}).get("price_usd", 0) <= 0:
+        return (True, "free", None)
     if not proof:
         return (False, "none", None)
     # Try the real facilitator path first.
@@ -351,7 +395,8 @@ def finalize_auto(service: str, subject: dict, verdict: str, confidence: int,
     return {"attestation_id": att_id, "status": "completed", "verdict": verdict,
             "confidence": confidence, "summary": summary, "evidence": evidence,
             "data": data or {}, "signature": sig, "public_key": PUBLIC_KEY_HEX,
-            "public_url": f"{BASE_URL}/a/{att_id}"}
+            "public_url": f"{BASE_URL}/a/{att_id}",
+            "pricing_notice": pricing_notice(service)}
 
 def _ofac_addresses() -> set:
     """Fetch + cache the OFAC sanctioned crypto address list (daily). Fails safe to cached/empty."""
@@ -648,15 +693,35 @@ def manifest():
         "public_key": PUBLIC_KEY_HEX,
         "verify_signature": "ed25519 over the canonical JSON at /v1/attestations/{id}?canonical=1",
         "payment": {"protocol": "x402", "network": PAY_NETWORK_CAIP, "asset": PAY_ASSET, "pay_to": PAYTO_ADDRESS},
-        "services": {k: {"title": v["title"], "description": v["description"], "price_usd": v["price_usd"]}
+        "services": {k: {"title": v["title"], "description": v["description"],
+                         "price_usd": v["price_usd"], "free": v.get("price_usd", 0) <= 0}
                      for k, v in SERVICES.items()},
+        "pricing": pricing_policy(),
         "how_to_use": {
             "1_request": f"POST {BASE_URL}/v1/verify  body: {{\"service\":\"entity_check\",\"subject\":{{...}}}}",
-            "2_pay": "Receive HTTP 402 with payment requirements. Pay, then retry with header X-PAYMENT.",
+            "2_pay": "Receive HTTP 402 with payment requirements (free services skip this). Pay, then retry with header X-PAYMENT.",
             "3_poll": f"GET {BASE_URL}/v1/attestations/{{id}} until status == completed",
             "4_verify": "Verify the ed25519 signature against public_key using the canonical payload",
         },
     }
+
+@app.get("/pricing")
+def pricing():
+    return pricing_policy()
+
+@app.get("/pricing.txt", response_class=PlainTextResponse)
+def pricing_txt():
+    p = pricing_policy()
+    lines = [f"# {BRAND} pricing (version {p['version']}, status: {p['status']})", "", p["notice"], "", "Services:"]
+    for k, v in p["services"].items():
+        price = "FREE" if v["free"] else f"${v['price_usd']:.2f} {p['currency']}"
+        lines.append(f"- {k} ({v['type']}): {price}")
+    lines += ["", "Guarantees:",
+              f"- {p['guarantees']['price_lock']}",
+              f"- At least {p['guarantees']['advance_notice_days']} days' notice before any price increase.",
+              f"- {p['guarantees']['detect_changes']}",
+              "", f"Machine-readable: GET {BASE_URL}/pricing"]
+    return "\n".join(lines)
 
 @app.get("/.well-known/attestly-pubkey")
 def pubkey():
@@ -696,11 +761,12 @@ def _agent_card():
              "description": "Instantly check an email's syntax, MX records, disposable-domain status, and deliverability signal; returns a signed verdict. Price: %.2f USDC." % SERVICES["email_check"]["price_usd"],
              "tags": ["verification", "email", "deliverability", "x402", "instant"],
              "examples": ["Is user@example.com a deliverable, non-disposable address?"]},
-            {"id": "notarize", "name": "Content notarization (instant)",
-             "description": "Instantly notarize content or a hash — an ed25519-signed proof it existed at time T. Proves existence, not authorship. Price: %.2f USDC." % SERVICES["notarize"]["price_usd"],
-             "tags": ["notary", "timestamp", "hash", "proof", "x402", "instant"],
+            {"id": "notarize", "name": "Content notarization (instant, FREE)",
+             "description": "Instantly notarize content or a hash — an ed25519-signed proof it existed at time T. Proves existence, not authorship. FREE (no payment) — the easiest way to try Attestly.",
+             "tags": ["notary", "timestamp", "hash", "proof", "x402", "instant", "free"],
              "examples": ["Notarize the SHA-256 of this agreement text."]},
         ],
+        "pricing": pricing_policy(),
     }
 
 @app.get("/.well-known/agent.json")
@@ -718,20 +784,24 @@ def llms_txt():
 - wallet_screen (${SERVICES['wallet_screen']['price_usd']:.2f} USDC): screen an EVM address vs OFAC sanctions + on-chain activity before you pay a counterparty. Informational, not compliance advice.
 - domain_check (${SERVICES['domain_check']['price_usd']:.2f} USDC): does a domain resolve, valid TLS, age, registrar, reachability.
 - email_check (${SERVICES['email_check']['price_usd']:.2f} USDC): syntax, MX records, disposable-domain detection, deliverability signal.
-- notarize (${SERVICES['notarize']['price_usd']:.2f} USDC): signed proof that content (or its hash) existed at time T. Existence, not authorship.
+- notarize (FREE): signed proof that content (or its hash) existed at time T. Existence, not authorship. No payment required — the easiest way to try Attestly.
 
 ## Human-verified checks (reviewed by a real person, usually within hours)
 - entity_check (${SERVICES['entity_check']['price_usd']:.0f} USDC): confirm a business/entity exists and matches given details.
 - claim_check (${SERVICES['claim_check']['price_usd']:.0f} USDC): check a factual claim or URL against real sources.
 
+## Pricing
+Introductory pricing ({PRICING_STATUS}, v{PRICING_VERSION}): intentionally low while Attestly builds a track record with early agents. Prices will rise as the service matures. The price quoted at request time is locked for that request, with at least {PRICE_CHANGE_NOTICE_DAYS} days' machine-readable notice before any change. Full terms (machine-readable): GET {BASE_URL}/pricing
+
 ## How an agent uses it
 1. POST {BASE_URL}/v1/verify  body: {{"service":"wallet_screen","subject":{{"address":"0x..."}}}}
-2. Receive HTTP 402 with x402 payment requirements. Pay in USDC, retry with header X-PAYMENT.
+2. Receive HTTP 402 with x402 payment requirements (free services skip this). Pay in USDC, retry with header X-PAYMENT.
 3. Automated services return the signed, completed attestation immediately. Human services return a job id — poll GET {BASE_URL}/v1/attestations/{{id}} until status == completed.
 4. Verify the ed25519 signature against the public key in the manifest.
 Or call the hosted MCP server at {BASE_URL}/mcp (tools: wallet_screen, domain_check, email_check, notarize, request_verification, get_attestation, get_services).
 
 ## Links
+- Pricing (JSON): {BASE_URL}/pricing
 - Manifest (JSON): {BASE_URL}/
 - Agent card (A2A): {BASE_URL}/.well-known/agent.json
 - Public key: {BASE_URL}/.well-known/attestly-pubkey
@@ -941,7 +1011,7 @@ def home():
         <div style="display:inline-block;margin-bottom:8px;background:{badge_bg};color:{badge_fg};font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:999px">{badge}</div>
         <div style="font-weight:700;font-size:18px">{v['title']}</div>
         <div style="color:#555;margin:8px 0">{v['description']}</div>
-        <div style="font-size:22px;font-weight:700;color:#2F5496">${v['price_usd']:.2f}<span style="font-size:13px;color:#888;font-weight:400"> / check</span></div>
+        <div style="font-size:22px;font-weight:700;color:#2F5496">{'Free' if v.get('price_usd',0)<=0 else '$'+format(v['price_usd'],'.2f')}<span style="font-size:13px;color:#888;font-weight:400"> {'· try it' if v.get('price_usd',0)<=0 else '/ check'}</span></div>
         </div>"""
     auto_cards = "".join(card(v) for v in SERVICES.values() if v.get("auto"))
     human_cards = "".join(card(v) for v in SERVICES.values() if not v.get("auto"))
@@ -962,7 +1032,8 @@ def home():
       <h3>Human-verified checks</h3>
       <p style="color:#666;margin-top:2px">A real person verifies against primary sources — for the calls automation can't make.</p>
       <div style="display:flex;gap:16px;flex-wrap:wrap;margin:14px 0 8px">{human_cards}</div>
-      <div style="display:inline-block;background:#eaf1fb;color:#2F5496;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:999px">Launch pricing — all services</div>
+      <div style="display:inline-block;background:#eaf1fb;color:#2F5496;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:999px">Introductory pricing</div>
+      <p style="color:#666;font-size:13.5px;margin:10px 0 0">Notarization is free to start. Introductory rates are intentionally low while we build a track record — prices will rise as the service matures, always with advance notice, and the price quoted when your agent calls is locked for that request. <a href="/pricing" style="color:#2F5496">Full pricing terms →</a></p>
 
       <h3 style="margin-top:32px">How it works</h3>
       <ol><li>Your agent calls <code>POST /v1/verify</code> (or the hosted MCP server at <code>/mcp</code>) and pays via x402 (USDC).</li>
