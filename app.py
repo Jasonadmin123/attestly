@@ -726,6 +726,26 @@ def admin_pending(x_admin_token: str | None = Header(default=None)):
     return [{"id": r["id"], "service": r["service"], "subject": json.loads(r["subject"]),
              "payment_status": r["payment_status"], "created_at": r["created_at"]} for r in rows]
 
+@app.get("/admin/jobs")
+def admin_jobs(x_admin_token: str | None = Header(default=None)):
+    require_admin(x_admin_token)
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT * FROM attestations ORDER BY created_at DESC").fetchall()
+    out = []
+    for r in rows:
+        svc = SERVICES.get(r["service"], {})
+        out.append({
+            "id": r["id"], "service": r["service"], "auto": bool(svc.get("auto")),
+            "subject": json.loads(r["subject"]), "status": r["status"],
+            "verdict": r["verdict"], "summary": r["summary"], "confidence": r["confidence"],
+            "evidence": json.loads(r["evidence"] or "[]"),
+            "payment_ref": r["payment_ref"], "payment_status": r["payment_status"],
+            "price_usd": svc.get("price_usd", 0), "issuer": r["issuer"],
+            "created_at": r["created_at"], "completed_at": r["completed_at"],
+            "signature": r["signature"], "public_url": f"{BASE_URL}/a/{r['id']}",
+        })
+    return out
+
 @app.post("/admin/attestations/{att_id}/complete")
 def complete(att_id: str, body: CompleteRequest, x_admin_token: str | None = Header(default=None)):
     require_admin(x_admin_token)
@@ -832,28 +852,95 @@ def home():
 def admin_console():
     return HTMLResponse("""<!doctype html><meta charset=utf-8><title>Attestly admin</title>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<body style="font-family:system-ui;max-width:820px;margin:0 auto;padding:32px 18px;color:#1a1a1a">
+<body style="font-family:system-ui;max-width:900px;margin:0 auto;padding:32px 18px;color:#1a1a1a">
 <h1 style="color:#2F5496">Attestly — fulfillment console</h1>
-<p>Enter your admin token, load pending jobs, verify each against real sources, then sign & publish.</p>
+<p>Enter your admin token. <b>Load pending</b> = human jobs awaiting your verdict. <b>Load all jobs</b> = every check (incl. instant automated ones); click any row for full details.</p>
 <div style="margin:12px 0">
-  <input id=tok type=password placeholder="admin token" style="padding:8px;width:280px">
+  <input id=tok type=password placeholder="admin token" style="padding:8px;width:260px">
   <button onclick=load() style="padding:8px 14px">Load pending</button>
+  <button onclick=loadAll() style="padding:8px 14px">Load all jobs</button>
   <span id=msg style="margin-left:10px;color:#666"></span>
 </div>
 <div id=stats style="display:flex;gap:12px;flex-wrap:wrap;margin:10px 0"></div>
+<div id=legend style="display:none;font-size:12.5px;color:#555;background:#f6f8fc;border:1px solid #e2e8f5;border-radius:8px;padding:10px 12px;margin:8px 0">
+  <b>Payment column:</b>
+  <span style="color:#0a7d2c">verified</span> = real on-chain payment confirmed ·
+  <span style="color:#8a6d00">unverified_manual</span> = accepted in manual mode, <b>no real USDC confirmed</b> (likely a test) ·
+  <span style="color:#667">auto</span> = automated check (no separate payment record) ·
+  <span style="color:#b00020">none</span> = no payment. Until the facilitator is wired, revenue counts every completed check — so test traffic inflates it.
+</div>
 <div id=list></div>
 <script>
 const H=()=>({'X-ADMIN-TOKEN':document.getElementById('tok').value,'content-type':'application/json'});
 function tile(label,val){return `<div style="border:1px solid #e5e5e5;border-radius:10px;padding:12px 16px;min-width:110px"><div style="font-size:22px;font-weight:700;color:#2F5496">${val}</div><div style="font-size:12px;color:#666">${label}</div></div>`;}
+function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function payColor(p){return {verified:'#0a7d2c',unverified_manual:'#8a6d00',auto:'#667',none:'#b00020'}[p]||'#667';}
+function statusChip(s){const c={completed:'#0a7d2c',pending:'#8a6d00'}[s]||'#667';return `<span style="background:${c};color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase">${esc(s)}</span>`;}
 async function loadStats(){
   const r=await fetch('/admin/stats',{headers:H()});
   if(!r.ok)return;
   const s=await r.json();
   document.getElementById('stats').innerHTML=
-    tile('Total jobs',s.total_jobs)+tile('Pending',s.pending)+tile('Completed',s.completed)+tile('Revenue','$'+s.revenue_usd);
+    tile('Total jobs',s.total_jobs)+tile('Pending',s.pending)+tile('Completed',s.completed)+tile('Revenue (unverified)','$'+s.revenue_usd);
+}
+async function loadAll(){
+  document.getElementById('msg').textContent='loading...';
+  document.getElementById('legend').style.display='block';
+  loadStats();
+  const r=await fetch('/admin/jobs',{headers:H()});
+  if(!r.ok){document.getElementById('msg').textContent='error '+r.status;return;}
+  const jobs=await r.json();
+  let real=0; jobs.forEach(j=>{if(j.status==='completed'&&j.payment_status==='verified')real+=j.price_usd;});
+  document.getElementById('msg').innerHTML=jobs.length+' total · <b style="color:#0a7d2c">$'+real.toFixed(2)+' verified revenue</b>';
+  const L=document.getElementById('list');L.innerHTML='';
+  if(!jobs.length){L.innerHTML='<p style=color:#888>No jobs yet.</p>';return;}
+  for(const j of jobs){
+    const d=document.createElement('div');
+    d.style.cssText='border:1px solid #e5e5e5;border-radius:10px;margin:10px 0;overflow:hidden';
+    const subj=JSON.stringify(j.subject);
+    const summ=subj.length>70?subj.slice(0,70)+'…':subj;
+    const verdict=j.verdict?` · <b style="text-transform:capitalize">${esc(j.verdict)}</b>`:'';
+    d.innerHTML=`
+      <div onclick="tog('${j.id}')" style="cursor:pointer;padding:12px 14px;display:flex;flex-wrap:wrap;gap:8px;align-items:center">
+        ${statusChip(j.status)}
+        <b>${esc(j.service)}</b>
+        <span style="color:#888">$${j.price_usd.toFixed(2)}</span>
+        <span style="color:${payColor(j.payment_status)};font-weight:600">${esc(j.payment_status)}</span>
+        ${verdict}
+        <span style="color:#aaa;font-size:12px;margin-left:auto">${esc(j.created_at)} ▾</span>
+      </div>
+      <div style="color:#666;font-size:12.5px;padding:0 14px 10px">${esc(summ)}</div>
+      <div id="dt_${j.id}" style="display:none;border-top:1px solid #eee;padding:14px;background:#fafbfc"></div>`;
+    L.appendChild(d);
+    d._job=j;
+  }
+}
+function tog(id){
+  const box=document.getElementById('dt_'+id);
+  if(box.style.display==='block'){box.style.display='none';return;}
+  const j=[...document.getElementById('list').children].map(c=>c._job).find(x=>x&&x.id===id);
+  const ev=(j.evidence||[]).map(e=>`<li>${esc(e.label||'')} ${e.url?'<a href="'+esc(e.url)+'" target=_blank>'+esc(e.url)+'</a>':''} ${esc(e.note||'')}</li>`).join('')||'<li>(none)</li>';
+  box.innerHTML=`
+    <div style="font-size:12px;color:#888;margin-bottom:6px">${esc(j.id)} · <a href="${esc(j.public_url)}" target=_blank>public page ↗</a> ${j.auto?'· <span style="color:#0a7d2c">automated</span>':'· human'}</div>
+    <table style="font-size:13px;border-collapse:collapse">
+      <tr><td style="color:#888;padding:2px 12px 2px 0">Status</td><td>${esc(j.status)}</td></tr>
+      <tr><td style="color:#888;padding:2px 12px 2px 0">Verdict</td><td>${esc(j.verdict||'—')} ${j.confidence!=null?'('+esc(j.confidence)+'%)':''}</td></tr>
+      <tr><td style="color:#888;padding:2px 12px 2px 0">Payment</td><td style="color:${payColor(j.payment_status)}">${esc(j.payment_status)}</td></tr>
+      <tr><td style="color:#888;padding:2px 12px 2px 0">Payment ref</td><td><code>${esc(j.payment_ref||'—')}</code></td></tr>
+      <tr><td style="color:#888;padding:2px 12px 2px 0">Created</td><td>${esc(j.created_at)}</td></tr>
+      <tr><td style="color:#888;padding:2px 12px 2px 0">Completed</td><td>${esc(j.completed_at||'—')}</td></tr>
+      <tr><td style="color:#888;padding:2px 12px 2px 0">Issuer</td><td>${esc(j.issuer||'—')}</td></tr>
+    </table>
+    <div style="margin-top:8px;color:#888;font-size:12px">Summary</div><div>${esc(j.summary||'—')}</div>
+    <div style="margin-top:8px;color:#888;font-size:12px">Subject</div>
+    <pre style="background:#fff;border:1px solid #eee;padding:8px;border-radius:6px;white-space:pre-wrap;font-size:12px">${esc(JSON.stringify(j.subject,null,2))}</pre>
+    <div style="margin-top:8px;color:#888;font-size:12px">Evidence</div><ul style="margin:4px 0">${ev}</ul>
+    <div style="margin-top:8px;color:#888;font-size:12px">Signature</div><code style="word-break:break-all;font-size:11px">${esc(j.signature||'—')}</code>`;
+  box.style.display='block';
 }
 async function load(){
   document.getElementById('msg').textContent='loading...';
+  document.getElementById('legend').style.display='none';
   loadStats();
   const r=await fetch('/admin/pending',{headers:H()});
   if(!r.ok){document.getElementById('msg').textContent='error '+r.status;return;}
