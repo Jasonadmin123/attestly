@@ -72,6 +72,11 @@ RPC_URLS = {
                  "https://ethereum-rpc.publicnode.com", "https://cloudflare-eth.com",
                  "https://eth.drpc.org"],
 }
+# Blockscout explorers — free, keyless. Used for the wallet "age / first-tx" signal.
+BLOCKSCOUT_URLS = {
+    "base": os.environ.get("BASE_BLOCKSCOUT_URL", "https://base.blockscout.com"),
+    "ethereum": os.environ.get("ETH_BLOCKSCOUT_URL", "https://eth.blockscout.com"),
+}
 OFAC_LIST_URL = os.environ.get(
     "OFAC_LIST_URL",
     "https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_ETH.txt",
@@ -359,6 +364,22 @@ def run_email_check(subject: dict):
     evidence = [{"label": "mx", "note": str(mx)}, {"label": "disposable", "note": str(disposable)}]
     return (verdict, conf, summary, evidence, data, {"email": email})
 
+def _wallet_age(addr: str, network: str):
+    """First-transaction date + age in days via Blockscout (free, keyless). (age_days, first_tx_iso) or (None, None)."""
+    base = BLOCKSCOUT_URLS.get(network, BLOCKSCOUT_URLS["base"])
+    try:
+        r = httpx.get(f"{base}/api", params={"module": "account", "action": "txlist",
+                      "address": addr, "sort": "asc", "page": 1, "offset": 1}, timeout=10)
+        j = r.json()
+        res = j.get("result")
+        if j.get("status") == "1" and isinstance(res, list) and res:
+            ts = int(res[0]["timeStamp"])
+            first = datetime.utcfromtimestamp(ts)
+            return ((datetime.utcnow() - first).days, first.isoformat() + "Z")
+    except Exception:
+        pass
+    return (None, None)
+
 def run_wallet_screen(subject: dict):
     addr = (subject.get("address") or "").strip()
     network = (subject.get("network") or "base").lower()
@@ -379,22 +400,33 @@ def run_wallet_screen(subject: dict):
                 break   # got a working endpoint
         except Exception:
             continue
+    age_days, first_tx = _wallet_age(addr, network)
     flags = []
     if sanctioned:
         verdict, conf, risk = "refuted", 99, "high"; flags.append("OFAC-sanctioned")
-    elif tx_count is None:
+    elif tx_count is None and age_days is None:
         verdict, conf, risk = "uncertain", 50, "unknown"; flags.append("could not read chain")
-    elif tx_count == 0:
+    elif (tx_count == 0) or (age_days == 0 and not tx_count):
         verdict, conf, risk = "uncertain", 70, "medium"; flags.append("no on-chain history")
     else:
         verdict, conf, risk = "confirmed", 80, "low"
+    # Age enrichment: a very fresh address is a mild risk signal even if it has activity.
+    if age_days is not None:
+        if age_days < 7 and risk == "low":
+            risk, conf = "medium", 70; flags.append("very new address (<7d)")
+        elif age_days < 30 and risk == "low":
+            flags.append("new address (<30d)")
+        elif age_days >= 365 and risk == "low":
+            conf = 88; flags.append("established (1y+)")
     summary = (f"{addr} ({network}): sanctioned={sanctioned}, balance={balance}, "
-               f"tx_count={tx_count} → risk {risk}.")
+               f"tx_count={tx_count}, age={age_days}d → risk {risk}.")
     data = {"address": addr, "network": network, "sanctioned": sanctioned,
             "sanctions_source": "OFAC SDN crypto list", "sanctions_snapshot": _OFAC_CACHE.get("fetched_at"),
-            "balance": balance, "tx_count": tx_count, "risk_level": risk, "flags": flags}
+            "balance": balance, "tx_count": tx_count, "age_days": age_days, "first_tx": first_tx,
+            "risk_level": risk, "flags": flags}
     evidence = [{"label": "sanctions", "note": f"OFAC match={sanctioned}"},
-                {"label": "onchain", "note": f"balance={balance}, tx_count={tx_count}"}]
+                {"label": "onchain", "note": f"balance={balance}, tx_count={tx_count}"},
+                {"label": "age", "note": f"first_tx={first_tx}, age_days={age_days}"}]
     return (verdict, conf, summary, evidence, data, {"address": addr, "network": network})
 
 AUTO_RUNNERS = {
