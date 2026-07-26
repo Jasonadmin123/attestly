@@ -54,9 +54,82 @@ PAYTO_ADDRESS  = os.environ.get("PAYTO_ADDRESS", "0xYOUR_WALLET_ADDRESS")
 PAY_NETWORK    = os.environ.get("PAY_NETWORK", "base")
 PAY_ASSET      = os.environ.get("PAY_ASSET", "USDC")
 BASE_URL       = os.environ.get("BASE_URL", "http://localhost:8000")
-FACILITATOR_URL = os.environ.get("FACILITATOR_URL", "").rstrip("/")   # e.g. https://x402.org/facilitator
+FACILITATOR_URL = os.environ.get("FACILITATOR_URL", "").rstrip("/")   # override; else derived from network
 ALLOW_UNVERIFIED = os.environ.get("ALLOW_UNVERIFIED_PAYMENTS", "true").lower() == "true"
 CONTACT_EMAIL  = os.environ.get("CONTACT_EMAIL", "you@yourdomain.com")
+
+# --- x402 facilitator (real payments) -------------------------------------
+# CAIP-2 network. Default Base mainnet; set eip155:84532 for Base Sepolia testnet dry-runs.
+# The facilitator stays DORMANT (manual mode) on mainnet until CDP keys are present, so
+# deploying this changes nothing until you deliberately add CDP_API_KEY_ID/SECRET.
+PAY_NETWORK_CAIP = os.environ.get("PAY_NETWORK_CAIP", "eip155:8453")
+CDP_API_KEY_ID     = os.environ.get("CDP_API_KEY_ID")
+CDP_API_KEY_SECRET = os.environ.get("CDP_API_KEY_SECRET")
+# Everything below is optional & defensive: if x402 libs or config are absent,
+# the service falls back to manual mode exactly as before (never crashes on import).
+_X402_OK = False
+_X402_ASSET = None
+try:
+    from x402.mechanisms.evm.constants import NETWORK_CONFIGS as _NETCFG
+    from x402.http import (FacilitatorClientSync as _FacClient,
+                           FacilitatorConfig as _FacConfig,
+                           CreateHeadersAuthProvider as _AuthProvider,
+                           safe_base64_decode as _b64d)
+    from x402.schemas.payments import PaymentRequirements as _PayReq
+    from x402.schemas.helpers import parse_payment_payload as _parse_payload
+    _cfg = _NETCFG.get(PAY_NETWORK_CAIP)
+    if _cfg:
+        _X402_ASSET = _cfg["default_asset"]   # {address,name,version,decimals}
+        _X402_OK = True
+except Exception:
+    _X402_OK = False
+
+# Facilitator URL: explicit override, else CDP for mainnet, else public testnet facilitator.
+if FACILITATOR_URL:
+    _FAC_URL = FACILITATOR_URL
+elif PAY_NETWORK_CAIP == "eip155:8453":
+    _FAC_URL = "https://api.cdp.coinbase.com/platform/v2/x402"
+else:
+    _FAC_URL = "https://x402.org/facilitator"
+
+_FACILITATOR_SINGLETON = None
+def _cdp_auth_provider():
+    """CDP JWT auth for the mainnet facilitator; None for the keyless testnet facilitator."""
+    if not (CDP_API_KEY_ID and CDP_API_KEY_SECRET and "cdp.coinbase.com" in _FAC_URL):
+        return None
+    from cdp.auth.utils.http import get_auth_headers, GetAuthHeadersOptions
+    from urllib.parse import urlparse
+    u = urlparse(_FAC_URL); host = u.netloc; base = u.path.rstrip("/")
+    def _headers():
+        def hdr(op):
+            return get_auth_headers(GetAuthHeadersOptions(
+                api_key_id=CDP_API_KEY_ID, api_key_secret=CDP_API_KEY_SECRET,
+                request_method="POST", request_host=host, request_path=f"{base}/{op}"))
+        return {"verify": hdr("verify"), "settle": hdr("settle"),
+                "supported": hdr("supported"), "bazaar": {}}
+    return _AuthProvider(_headers)
+
+def _facilitator():
+    global _FACILITATOR_SINGLETON
+    if _FACILITATOR_SINGLETON is None:
+        _FACILITATOR_SINGLETON = _FacClient(_FacConfig(url=_FAC_URL, auth_provider=_cdp_auth_provider()))
+    return _FACILITATOR_SINGLETON
+
+def _payment_requirements(service_key: str):
+    """Spec-compliant x402 PaymentRequirements for a service (correct asset + EIP-712 domain)."""
+    svc = SERVICES[service_key]
+    atomic = str(int(round(svc["price_usd"] * (10 ** _X402_ASSET["decimals"]))))
+    return _PayReq(scheme="exact", network=PAY_NETWORK_CAIP, asset=_X402_ASSET["address"],
+                   amount=atomic, pay_to=PAYTO_ADDRESS, max_timeout_seconds=300,
+                   extra={"name": _X402_ASSET["name"], "version": _X402_ASSET["version"]})
+
+def facilitator_active() -> bool:
+    """True when we can actually verify+settle real payments (libs ok + mainnet CDP keys, or testnet)."""
+    if not _X402_OK:
+        return False
+    if PAY_NETWORK_CAIP == "eip155:8453":
+        return bool(CDP_API_KEY_ID and CDP_API_KEY_SECRET)
+    return True   # testnet facilitator is keyless
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")             # email alerts on new jobs
 ALERT_EMAIL    = os.environ.get("ALERT_EMAIL", "jason@theleadforge.com")
 ALERT_FROM     = os.environ.get("ALERT_FROM", "Attestly <onboarding@resend.dev>")
@@ -174,45 +247,64 @@ def canonical_payload(row) -> str:
 # ----------------------------------------------------------------------------
 def x402_challenge(service_key: str) -> JSONResponse:
     svc = SERVICES[service_key]
+    accepts = []
+    # Spec-compliant x402 requirements (correct USDC address + EIP-712 domain per network).
+    if _X402_OK:
+        try:
+            req = _payment_requirements(service_key).model_dump(by_alias=True)
+            req["resource"] = f"{BASE_URL}/v1/verify"
+            req["description"] = svc["title"]
+            req["mimeType"] = "application/json"
+            accepts.append(req)
+        except Exception:
+            pass
+    if not accepts:   # fallback human-readable form
+        accepts.append({"scheme": "exact", "network": PAY_NETWORK, "asset": PAY_ASSET,
+                        "amount": f"{svc['price_usd']:.2f}", "payTo": PAYTO_ADDRESS,
+                        "resource": f"{BASE_URL}/v1/verify", "description": svc["title"],
+                        "mimeType": "application/json"})
     return JSONResponse(status_code=402, content={
-        "x402Version": 1, "error": "payment_required",
-        "accepts": [{
-            "scheme": "exact", "network": PAY_NETWORK, "asset": PAY_ASSET,
-            "amount": f"{svc['price_usd']:.2f}", "payTo": PAYTO_ADDRESS,
-            "resource": f"{BASE_URL}/v1/verify", "description": svc["title"],
-            "mimeType": "application/json",
-        }],
+        "x402Version": 2 if _X402_OK else 1, "error": "payment_required",
+        "accepts": accepts,
         "note": "Pay the amount above in USDC, then retry with header 'X-PAYMENT: <payload>'.",
     })
 
-def check_payment(proof: str | None, service_key: str) -> tuple[bool, str]:
+def check_payment(proof: str | None, service_key: str) -> tuple[bool, str, str | None]:
     """
-    Returns (accepted, payment_status).
-    - If FACILITATOR_URL is set, verify the payment for real via the x402 facilitator.
-    - Else if ALLOW_UNVERIFIED_PAYMENTS, accept a non-empty proof but flag it so YOU
-      reconcile the on-chain payment before signing. (Fine for low-volume manual launch.)
-    - Else reject (safe default in production without a facilitator).
+    Returns (accepted, payment_status, tx_ref).
+    Order of preference:
+      1. Real x402 facilitator: parse the X-PAYMENT payload, VERIFY it, then SETTLE it
+         on-chain. Only 'verified' (with a tx hash) means money actually moved.
+      2. If the proof isn't a real x402 payload (or the facilitator errors) and manual
+         mode is on, accept it flagged 'unverified_manual' so YOU reconcile by hand.
+      3. Otherwise reject.
     """
     if not proof:
-        return (False, "none")
-    if FACILITATOR_URL:
-        svc = SERVICES[service_key]
-        requirements = {
-            "scheme": "exact", "network": PAY_NETWORK, "asset": PAY_ASSET,
-            "amount": f"{svc['price_usd']:.2f}", "payTo": PAYTO_ADDRESS,
-            "resource": f"{BASE_URL}/v1/verify",
-        }
+        return (False, "none", None)
+    # Try the real facilitator path first.
+    if facilitator_active():
         try:
-            r = httpx.post(f"{FACILITATOR_URL}/verify",
-                           json={"x402Version": 1, "paymentPayload": proof, "paymentRequirements": requirements},
-                           timeout=15)
-            ok = r.status_code == 200 and r.json().get("isValid", r.json().get("valid", False))
-            return (bool(ok), "verified" if ok else "rejected")
+            payload = _parse_payload(_b64d(proof))          # base64 X-PAYMENT -> PaymentPayload
         except Exception:
-            return (False, "facilitator_error")
+            payload = None
+        if payload is not None:
+            try:
+                reqs = _payment_requirements(service_key)
+                v = _facilitator().verify(payload, reqs)
+                if not getattr(v, "is_valid", False):
+                    return (False, "rejected", None)
+                s = _facilitator().settle(payload, reqs)
+                if getattr(s, "success", False):
+                    return (True, "verified", getattr(s, "transaction", None))
+                return (False, "settle_failed", None)
+            except Exception:
+                if ALLOW_UNVERIFIED:
+                    return (True, "unverified_manual", None)
+                return (False, "facilitator_error", None)
+    # Manual fallback (launch mode): accept a non-empty proof, flag for hand reconciliation.
     if ALLOW_UNVERIFIED:
-        return (True, "unverified_manual")
-    return (False, "no_facilitator")
+        return (True, "unverified_manual", None)
+    return (False, "no_facilitator", None)
 
 # ----------------------------------------------------------------------------
 # App
@@ -238,17 +330,19 @@ def notify_new_job(att_id: str, service: str) -> None:
 # Automated checks (no human) — run synchronously, sign, return completed.
 # ----------------------------------------------------------------------------
 def finalize_auto(service: str, subject: dict, verdict: str, confidence: int,
-                  summary: str, evidence=None, data=None) -> dict:
-    """Create an already-completed, signed attestation for an automated check."""
+                  summary: str, evidence=None, data=None,
+                  payment_status: str = "auto", payment_ref: str | None = None) -> dict:
+    """Create an already-completed, signed attestation for an automated check.
+    payment_status: 'verified' (real settled payment) counts as revenue; 'auto' = free/test."""
     evidence = evidence or []
     att_id = "at_" + secrets.token_hex(8)
     now = now_iso()
     with closing(db()) as conn:
         conn.execute(
-            "INSERT INTO attestations (id,service,subject,status,verdict,summary,evidence,confidence,payment_status,created_at,completed_at,issuer) "
-            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO attestations (id,service,subject,status,verdict,summary,evidence,confidence,payment_ref,payment_status,created_at,completed_at,issuer) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (att_id, service, json.dumps(subject), "completed", verdict, summary,
-             json.dumps(evidence), confidence, "auto", now, now, "Attestly automated check"))
+             json.dumps(evidence), confidence, payment_ref, payment_status or "auto", now, now, "Attestly automated check"))
         conn.commit()
         row = conn.execute("SELECT * FROM attestations WHERE id=?", (att_id,)).fetchone()
         sig = SIGNING_KEY.sign(canonical_payload(row).encode(), encoder=HexEncoder).signature.decode()
@@ -436,10 +530,11 @@ AUTO_RUNNERS = {
     "wallet_screen": run_wallet_screen,
 }
 
-def run_auto(service: str, subject: dict) -> dict:
+def run_auto(service: str, subject: dict, payment_status: str = "auto", payment_ref: str | None = None) -> dict:
     """Run an automated check and return a signed, completed attestation."""
     verdict, conf, summary, evidence, data, stored_subject = AUTO_RUNNERS[service](subject)
-    return finalize_auto(service, stored_subject, verdict, conf, summary, evidence, data)
+    return finalize_auto(service, stored_subject, verdict, conf, summary, evidence, data,
+                         payment_status=payment_status, payment_ref=payment_ref)
 
 # ----------------------------------------------------------------------------
 # Hosted MCP server (remote, callable at /mcp) — so any MCP agent can use Attestly
@@ -451,7 +546,7 @@ _mcp = FastMCP("Attestly")
 def get_services() -> dict:
     """List Attestly's verification services, prices (USDC), and how payment works."""
     return {"services": SERVICES,
-            "payment": {"protocol": "x402", "network": PAY_NETWORK, "asset": PAY_ASSET, "pay_to": PAYTO_ADDRESS}}
+            "payment": {"protocol": "x402", "network": PAY_NETWORK_CAIP, "asset": PAY_ASSET, "pay_to": PAYTO_ADDRESS}}
 
 @_mcp.tool
 def request_verification(service: str, subject: dict, payment: str = "") -> dict:
@@ -461,16 +556,16 @@ def request_verification(service: str, subject: dict, payment: str = "") -> dict
     payment: your x402 payment proof. Omit to first receive payment requirements, then pay and call again."""
     if service not in SERVICES:
         return {"error": f"unknown service '{service}'. Use get_services()."}
-    accepted, pay_status = check_payment(payment or None, service)
+    accepted, pay_status, tx_ref = check_payment(payment or None, service)
     if not accepted:
         svc = SERVICES[service]
-        return {"payment_required": {"protocol": "x402", "network": PAY_NETWORK, "asset": PAY_ASSET,
+        return {"payment_required": {"protocol": "x402", "network": PAY_NETWORK_CAIP, "asset": PAY_ASSET,
                                      "amount": f"{svc['price_usd']:.2f}", "payTo": PAYTO_ADDRESS},
                 "note": "Pay the amount in USDC, then call request_verification again with the payment proof."}
     att_id = "at_" + secrets.token_hex(8)
     with closing(db()) as conn:
         conn.execute("INSERT INTO attestations (id,service,subject,status,payment_ref,payment_status,created_at) VALUES (?,?,?,?,?,?,?)",
-                     (att_id, service, json.dumps(subject), "pending", (payment or "")[:80], pay_status, now_iso()))
+                     (att_id, service, json.dumps(subject), "pending", (tx_ref or (payment or "")[:80]), pay_status, now_iso()))
         conn.commit()
     notify_new_job(att_id, service)
     return {"attestation_id": att_id, "status": "pending",
@@ -495,10 +590,10 @@ def get_attestation(attestation_id: str) -> dict:
 
 def _auto_tool(service: str, subject: dict, payment: str):
     """Shared body for the automated MCP tools: gate on payment, run, return signed result."""
-    accepted, _ = check_payment(payment or None, service)
+    accepted, _, _ = check_payment(payment or None, service)
     if not accepted:
         svc = SERVICES[service]
-        return {"payment_required": {"protocol": "x402", "network": PAY_NETWORK, "asset": PAY_ASSET,
+        return {"payment_required": {"protocol": "x402", "network": PAY_NETWORK_CAIP, "asset": PAY_ASSET,
                                      "amount": f"{svc['price_usd']:.2f}", "payTo": PAYTO_ADDRESS},
                 "note": f"Pay {svc['price_usd']:.2f} USDC, then call again with the payment proof. Instant, signed result on payment."}
     try:
@@ -552,7 +647,7 @@ def manifest():
         "summary": "The trust layer for AI agents: instant automated checks (wallet/sanctions, domain, email, notarization) plus human-verified attestations — all cryptographically signed (ed25519). Pay per check in USDC via x402.",
         "public_key": PUBLIC_KEY_HEX,
         "verify_signature": "ed25519 over the canonical JSON at /v1/attestations/{id}?canonical=1",
-        "payment": {"protocol": "x402", "network": PAY_NETWORK, "asset": PAY_ASSET, "pay_to": PAYTO_ADDRESS},
+        "payment": {"protocol": "x402", "network": PAY_NETWORK_CAIP, "asset": PAY_ASSET, "pay_to": PAYTO_ADDRESS},
         "services": {k: {"title": v["title"], "description": v["description"], "price_usd": v["price_usd"]}
                      for k, v in SERVICES.items()},
         "how_to_use": {
@@ -652,20 +747,20 @@ class VerifyRequest(BaseModel):
 def verify(req: VerifyRequest, x_payment: str | None = Header(default=None)):
     if req.service not in SERVICES:
         raise HTTPException(400, f"unknown service '{req.service}'. See GET / for options.")
-    accepted, pay_status = check_payment(x_payment, req.service)
+    accepted, pay_status, tx_ref = check_payment(x_payment, req.service)
     if not accepted:
         return x402_challenge(req.service)
     # Automated services run synchronously and return a signed, completed attestation now.
     if SERVICES[req.service].get("auto"):
         try:
-            return run_auto(req.service, req.subject)
+            return run_auto(req.service, req.subject, payment_status=pay_status, payment_ref=tx_ref)
         except ValueError as e:
             raise HTTPException(400, str(e))
     att_id = "at_" + secrets.token_hex(8)
     with closing(db()) as conn:
         conn.execute("INSERT INTO attestations (id,service,subject,status,payment_ref,payment_status,created_at) VALUES (?,?,?,?,?,?,?)",
                      (att_id, req.service, json.dumps(req.subject), "pending",
-                      (x_payment or "")[:80], pay_status, now_iso()))
+                      (tx_ref or (x_payment or "")[:80]), pay_status, now_iso()))
         conn.commit()
     notify_new_job(att_id, req.service)
     return {"attestation_id": att_id, "status": "pending", "payment_status": pay_status,
@@ -701,6 +796,33 @@ class CompleteRequest(BaseModel):
 def require_admin(token: str | None):
     if token != ADMIN_TOKEN:
         raise HTTPException(401, "bad admin token")
+
+@app.get("/admin/facilitator")
+def admin_facilitator(x_admin_token: str | None = Header(default=None)):
+    """Smoke-test the payment facilitator (auth + connectivity) WITHOUT any payment."""
+    require_admin(x_admin_token)
+    info = {
+        "x402_lib_loaded": _X402_OK,
+        "network_caip": PAY_NETWORK_CAIP,
+        "network_is_mainnet": PAY_NETWORK_CAIP == "eip155:8453",
+        "facilitator_url": _FAC_URL,
+        "cdp_keys_present": bool(CDP_API_KEY_ID and CDP_API_KEY_SECRET),
+        "facilitator_active": facilitator_active(),
+        "manual_fallback_on": ALLOW_UNVERIFIED,
+        "asset": _X402_ASSET if _X402_OK else None,
+        "mode": "REAL verify+settle" if facilitator_active() else "manual (no real settlement yet)",
+    }
+    # Live authenticated call — proves keys + auth + endpoint reachability.
+    if facilitator_active():
+        try:
+            sup = _facilitator().get_supported()
+            kinds = getattr(sup, "kinds", None) or getattr(sup, "supported", None) or sup
+            info["get_supported_ok"] = True
+            info["supported_sample"] = str(kinds)[:500]
+        except Exception as e:
+            info["get_supported_ok"] = False
+            info["error"] = f"{type(e).__name__}: {str(e)[:300]}"
+    return info
 
 @app.get("/admin/stats")
 def admin_stats(x_admin_token: str | None = Header(default=None)):

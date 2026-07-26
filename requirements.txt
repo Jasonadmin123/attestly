@@ -7,3 +7,5 @@ mcp>=1.2
 fastmcp>=2.0
 python-whois>=0.9
 dnspython>=2.6
+x402>=2.16
+cdp-sdk>=1.47
