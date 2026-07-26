@@ -31,8 +31,9 @@ import asyncio
 import hashlib
 import sqlite3
 import secrets
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from contextlib import closing, asynccontextmanager
+from collections import defaultdict
 
 import httpx
 import whois
@@ -463,6 +464,61 @@ async def _moltbook_poll_loop() -> None:
         await asyncio.sleep(max(5, MOLTBOOK_POLL_MINUTES) * 60)
 
 # ----------------------------------------------------------------------------
+# Traffic metrics — count discovery + intent hits so you can see interest
+# before revenue. In-memory deltas, flushed to SQLite periodically.
+# ----------------------------------------------------------------------------
+_METRIC_DELTAS: dict = defaultdict(int)
+
+def _metric_label(path: str, status: int) -> str | None:
+    """Map a request to a meaningful metric label, or None to ignore (health/admin/noise)."""
+    p = path.rstrip("/") or "/"
+    if p == "/": return "manifest"
+    if p.startswith("/.well-known/agent"): return "agent_card"
+    if p == "/.well-known/attestly-pubkey": return "pubkey"
+    if p == "/llms.txt": return "llms_txt"
+    if p.startswith("/pricing"): return "pricing"
+    if p == "/home": return "home"
+    if p == "/mcp" or p.startswith("/mcp/"): return "mcp"
+    if p == "/v1/verify":
+        if status == 402: return "verify_payment_prompt"   # agent hit the paywall = intent
+        if status == 200: return "verify_completed"
+        return "verify_other"
+    if p.startswith("/a/"): return "attestation_view"       # public signed-result page
+    if p.startswith("/v1/attestations"): return "attestation_api"
+    return None
+
+def _record_metric(path: str, status: int) -> None:
+    lbl = _metric_label(path, status)
+    if not lbl:
+        return
+    day = now_iso()[:10]
+    _METRIC_DELTAS[(day, lbl)] += 1
+
+def _flush_metrics() -> None:
+    if not _METRIC_DELTAS:
+        return
+    deltas = dict(_METRIC_DELTAS); _METRIC_DELTAS.clear()
+    try:
+        with closing(db()) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS metrics (day TEXT, label TEXT, count INTEGER, PRIMARY KEY(day,label))")
+            for (day, lbl), c in deltas.items():
+                conn.execute("INSERT INTO metrics (day,label,count) VALUES (?,?,?) "
+                             "ON CONFLICT(day,label) DO UPDATE SET count=count+excluded.count", (day, lbl, c))
+            conn.commit()
+    except Exception:
+        # on failure, put deltas back so we don't lose them
+        for k, v in deltas.items():
+            _METRIC_DELTAS[k] += v
+
+async def _metrics_flush_loop() -> None:
+    while True:
+        await asyncio.sleep(60)
+        try:
+            await asyncio.to_thread(_flush_metrics)
+        except Exception:
+            pass
+
+# ----------------------------------------------------------------------------
 # Automated checks (no human) — run synchronously, sign, return completed.
 # ----------------------------------------------------------------------------
 def finalize_auto(service: str, subject: dict, verdict: str, confidence: int,
@@ -883,17 +939,32 @@ _mcp_app = _mcp.http_app(path="/mcp")   # internal route is exactly /mcp (no tra
 
 @asynccontextmanager
 async def _app_lifespan(app):
-    # Start the Moltbook activity poller (if configured) alongside the MCP lifespan.
-    poll_task = asyncio.create_task(_moltbook_poll_loop()) if MOLTBOOK_API_KEY else None
+    # Background tasks: metrics flush (always) + Moltbook poller (if configured), alongside MCP lifespan.
+    tasks = [asyncio.create_task(_metrics_flush_loop())]
+    if MOLTBOOK_API_KEY:
+        tasks.append(asyncio.create_task(_moltbook_poll_loop()))
     async with _mcp_app.lifespan(app):
         yield
-    if poll_task:
-        poll_task.cancel()
+    try:
+        _flush_metrics()   # final flush on shutdown
+    except Exception:
+        pass
+    for t in tasks:
+        t.cancel()
 
 app = FastAPI(title=BRAND, version="0.2.0", lifespan=_app_lifespan)
 # Attach the MCP route(s) directly (instead of app.mount) so /mcp works without a redirect.
 for _r in _mcp_app.routes:
     app.router.routes.append(_r)
+
+@app.middleware("http")
+async def _traffic_metrics_mw(request, call_next):
+    response = await call_next(request)
+    try:
+        _record_metric(request.url.path, response.status_code)
+    except Exception:
+        pass
+    return response
 
 @app.get("/healthz")
 def healthz():
@@ -1115,6 +1186,24 @@ def admin_facilitator(x_admin_token: str | None = Header(default=None)):
             info["error"] = f"{type(e).__name__}: {str(e)[:300]}"
     return info
 
+@app.get("/admin/metrics")
+def admin_metrics(x_admin_token: str | None = Header(default=None)):
+    """Traffic to discovery + intent endpoints — who's looking, and who's hitting the paywall."""
+    require_admin(x_admin_token)
+    _flush_metrics()
+    with closing(db()) as conn:
+        conn.execute("CREATE TABLE IF NOT EXISTS metrics (day TEXT, label TEXT, count INTEGER, PRIMARY KEY(day,label))")
+        rows = conn.execute("SELECT day,label,count FROM metrics").fetchall()
+    today = now_iso()[:10]
+    week = {(datetime.now(timezone.utc).date() - timedelta(days=i)).isoformat() for i in range(7)}
+    all_time, last7, today_c = defaultdict(int), defaultdict(int), defaultdict(int)
+    for r in rows:
+        all_time[r["label"]] += r["count"]
+        if r["day"] in week: last7[r["label"]] += r["count"]
+        if r["day"] == today: today_c[r["label"]] += r["count"]
+    return {"today": dict(today_c), "last_7_days": dict(last7), "all_time": dict(all_time),
+            "note": "Counts include bots/scanners. Strongest real-agent-intent signals: 'mcp' (agent connected) and 'verify_payment_prompt' (hit the paywall)."}
+
 @app.get("/admin/stats")
 def admin_stats(x_admin_token: str | None = Header(default=None)):
     require_admin(x_admin_token)
@@ -1279,6 +1368,7 @@ def admin_console():
   <input id=tok type=password placeholder="admin token" style="padding:8px;width:260px">
   <button onclick=load() style="padding:8px 14px">Load pending</button>
   <button onclick=loadAll() style="padding:8px 14px">Load all jobs</button>
+  <button onclick=loadTraffic() style="padding:8px 14px">Traffic</button>
   <span id=msg style="margin-left:10px;color:#666"></span>
 </div>
 <div id=stats style="display:flex;gap:12px;flex-wrap:wrap;margin:10px 0"></div>
@@ -1293,6 +1383,33 @@ def admin_console():
 <script>
 const H=()=>({'X-ADMIN-TOKEN':document.getElementById('tok').value,'content-type':'application/json'});
 function tile(label,val){return `<div style="border:1px solid #e5e5e5;border-radius:10px;padding:12px 16px;min-width:110px"><div style="font-size:22px;font-weight:700;color:#2F5496">${val}</div><div style="font-size:12px;color:#666">${label}</div></div>`;}
+const METRIC_LABELS={mcp:'🔌 MCP connects/calls (agent intent)',verify_payment_prompt:'💳 Paywall hits · 402 (buying intent)',verify_completed:'✅ Checks completed',manifest:'📄 Manifest views (/)',agent_card:'🪪 Agent card views',llms_txt:'📜 llms.txt views',pricing:'🏷️ Pricing views',home:'🏠 Landing page views',attestation_view:'🔎 Public result-page views',attestation_api:'📥 Attestation API reads',pubkey:'🔑 Public key fetches'};
+const METRIC_ORDER=['mcp','verify_payment_prompt','verify_completed','manifest','agent_card','llms_txt','pricing','home','attestation_view','attestation_api','pubkey'];
+async function loadTraffic(){
+  document.getElementById('msg').textContent='loading traffic...';
+  document.getElementById('legend').style.display='none';
+  document.getElementById('stats').innerHTML='';
+  const r=await fetch('/admin/metrics',{headers:H()});
+  if(!r.ok){document.getElementById('msg').textContent='error '+r.status;return;}
+  const m=await r.json();
+  const keys=[...new Set([...METRIC_ORDER,...Object.keys(m.all_time||{})])].filter(k=>(m.all_time||{})[k]!=null);
+  document.getElementById('msg').textContent='traffic';
+  let rows=keys.map(k=>{const lbl=METRIC_LABELS[k]||k;
+    return `<tr><td style="padding:6px 14px 6px 0">${lbl}</td>
+      <td style="text-align:right;padding:6px 14px;font-weight:700">${(m.today||{})[k]||0}</td>
+      <td style="text-align:right;padding:6px 14px;font-weight:700">${(m.last_7_days||{})[k]||0}</td>
+      <td style="text-align:right;padding:6px 0;color:#666">${(m.all_time||{})[k]||0}</td></tr>`;}).join('');
+  if(!rows) rows='<tr><td style="padding:8px;color:#888">No traffic recorded yet.</td></tr>';
+  document.getElementById('list').innerHTML=
+    `<h3 style="margin:6px 0">Traffic — who's looking</h3>
+     <table style="border-collapse:collapse;font-size:14px;margin:6px 0 12px">
+       <tr style="color:#888;font-size:12px;text-transform:uppercase"><td style="padding:0 14px 4px 0">Endpoint</td><td style="text-align:right;padding:0 14px">Today</td><td style="text-align:right;padding:0 14px">7 days</td><td style="text-align:right">All-time</td></tr>
+       ${rows}
+     </table>
+     <div style="font-size:12.5px;color:#555;background:#f6f8fc;border:1px solid #e2e8f5;border-radius:8px;padding:10px 12px;max-width:640px">
+       Counts include bots &amp; scanners. The two rows that signal a <b>real agent with intent</b> are <b>🔌 MCP connects</b> (an agent wired you into its toolset) and <b>💳 Paywall hits (402)</b> (an agent called a paid check and got the payment challenge). Discovery views (manifest, agent card, llms.txt) show you're being <i>found</i>; MCP + 402 show you're being <i>used</i>.
+     </div>`;
+}
 function esc(s){return String(s==null?'':s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
 function payColor(p){return {verified:'#0a7d2c',unverified_manual:'#8a6d00',auto:'#667',none:'#b00020'}[p]||'#667';}
 function statusChip(s){const c={completed:'#0a7d2c',pending:'#8a6d00'}[s]||'#667';return `<span style="background:${c};color:#fff;font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px;text-transform:uppercase">${esc(s)}</span>`;}
