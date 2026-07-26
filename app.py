@@ -232,10 +232,12 @@ def get_attestation(attestation_id: str) -> dict:
                     "signature": row["signature"], "public_key": PUBLIC_KEY_HEX})
     return out
 
-_mcp_app = _mcp.http_app(path="/")
+_mcp_app = _mcp.http_app(path="/mcp")   # internal route is exactly /mcp (no trailing-slash redirect)
 
 app = FastAPI(title=BRAND, version="0.2.0", lifespan=_mcp_app.lifespan)
-app.mount("/mcp", _mcp_app)
+# Attach the MCP route(s) directly (instead of app.mount) so /mcp works without a redirect.
+for _r in _mcp_app.routes:
+    app.router.routes.append(_r)
 
 @app.get("/healthz")
 def healthz():
