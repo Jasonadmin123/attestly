@@ -706,17 +706,23 @@ def require_admin(token: str | None):
 def admin_stats(x_admin_token: str | None = Header(default=None)):
     require_admin(x_admin_token)
     with closing(db()) as conn:
-        rows = conn.execute("SELECT service, status FROM attestations").fetchall()
+        rows = conn.execute("SELECT service, status, payment_status FROM attestations").fetchall()
     total = len(rows)
     pending = sum(1 for r in rows if r["status"] == "pending")
     completed = sum(1 for r in rows if r["status"] == "completed")
-    revenue = round(sum(SERVICES.get(r["service"], {}).get("price_usd", 0)
-                        for r in rows if r["status"] == "completed"), 2)
+    # Real revenue = completed jobs whose payment was actually verified on-chain.
+    verified_revenue = round(sum(SERVICES.get(r["service"], {}).get("price_usd", 0)
+                                 for r in rows if r["status"] == "completed"
+                                 and r["payment_status"] == "verified"), 2)
+    # Gross = every completed check regardless of payment (includes test/unverified/auto).
+    gross = round(sum(SERVICES.get(r["service"], {}).get("price_usd", 0)
+                      for r in rows if r["status"] == "completed"), 2)
     by_service = {}
     for r in rows:
         by_service[r["service"]] = by_service.get(r["service"], 0) + 1
     return {"total_jobs": total, "pending": pending, "completed": completed,
-            "revenue_usd": revenue, "by_service": by_service}
+            "revenue_usd": verified_revenue, "gross_completed_usd": gross,
+            "by_service": by_service}
 
 @app.get("/admin/pending")
 def admin_pending(x_admin_token: str | None = Header(default=None)):
@@ -881,7 +887,8 @@ async function loadStats(){
   if(!r.ok)return;
   const s=await r.json();
   document.getElementById('stats').innerHTML=
-    tile('Total jobs',s.total_jobs)+tile('Pending',s.pending)+tile('Completed',s.completed)+tile('Revenue (unverified)','$'+s.revenue_usd);
+    tile('Total jobs',s.total_jobs)+tile('Pending',s.pending)+tile('Completed',s.completed)
+    +tile('Revenue (verified)','$'+s.revenue_usd)+tile('Gross (incl. test)','$'+(s.gross_completed_usd!=null?s.gross_completed_usd:s.revenue_usd));
 }
 async function loadAll(){
   document.getElementById('msg').textContent='loading...';
