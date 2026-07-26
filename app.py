@@ -27,11 +27,12 @@ import re
 import ssl
 import socket
 import json
+import asyncio
 import hashlib
 import sqlite3
 import secrets
 from datetime import datetime, timezone
-from contextlib import closing
+from contextlib import closing, asynccontextmanager
 
 import httpx
 import whois
@@ -62,6 +63,12 @@ PRICING_VERSION = os.environ.get("PRICING_VERSION", "2026.07")
 PRICING_STATUS  = os.environ.get("PRICING_STATUS", "introductory")
 PRICE_CHANGE_NOTICE_DAYS = int(os.environ.get("PRICE_CHANGE_NOTICE_DAYS", "14"))
 PRICING_EFFECTIVE_DATE   = os.environ.get("PRICING_EFFECTIVE_DATE") or None  # set when a change is scheduled
+# Moltbook activity alerts (interim, until the engagement bot exists). Emails you when
+# a new comment/reply lands on your posts so you know to respond. Dormant unless the key is set.
+MOLTBOOK_API_KEY = os.environ.get("MOLTBOOK_API_KEY")
+MOLTBOOK_POLL_MINUTES = int(os.environ.get("MOLTBOOK_POLL_MINUTES", "15"))
+MOLTBOOK_STATE_PATH = os.environ.get("MOLTBOOK_STATE",
+                                     os.path.join(os.path.dirname(DB_PATH) or ".", "moltbook_state.json"))
 
 # --- x402 facilitator (real payments) -------------------------------------
 # CAIP-2 network. Default Base mainnet; set eip155:84532 for Base Sepolia testnet dry-runs.
@@ -394,6 +401,66 @@ def notify_payment_problem(service: str, status: str) -> None:
                 f"An agent attempted to pay for '{service}' but it did not settle cleanly (status: {status}).\n\n"
                 f"This may mean a payment-format/version mismatch. The check was NOT served for real money.\n"
                 f"Investigate {BASE_URL}/admin/facilitator and the facilitator logs. First real payment = expected test point.")
+
+# ----------------------------------------------------------------------------
+# Moltbook activity alerts (interim). Polls your Moltbook dashboard and emails
+# you when a new comment/reply lands on your posts, so you know when to respond.
+# ----------------------------------------------------------------------------
+def _moltbook_load_state() -> dict:
+    try:
+        with open(MOLTBOOK_STATE_PATH) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def _moltbook_save_state(state: dict) -> None:
+    try:
+        with open(MOLTBOOK_STATE_PATH, "w") as f:
+            json.dump(state, f)
+    except Exception:
+        pass
+
+def moltbook_check() -> None:
+    """One poll: fetch /home, email about posts with new activity since last seen."""
+    if not MOLTBOOK_API_KEY:
+        return
+    try:
+        h = httpx.get("https://www.moltbook.com/api/v1/home",
+                      headers={"Authorization": "Bearer " + MOLTBOOK_API_KEY}, timeout=15).json()
+    except Exception:
+        return
+    acts = h.get("activity_on_your_posts") or []
+    state = _moltbook_load_state()
+    seen = state.get("posts", {})
+    fresh = []
+    for a in acts:
+        pid = a.get("post_id")
+        latest = str(a.get("latest_at"))
+        if pid and seen.get(pid) != latest:
+            fresh.append(a)
+    if fresh:
+        lines = []
+        for a in fresh:
+            who = ", ".join(a.get("latest_commenters") or []) or "someone"
+            lines.append(f'- "{a.get("post_title")}": {a.get("new_notification_count")} new from {who}')
+        _send_email("Attestly · Moltbook 💬 new activity — time to respond",
+                    "New comments/replies on your Moltbook posts:\n\n" + "\n".join(lines) +
+                    "\n\nRespond here: https://www.moltbook.com/u/attestly\n"
+                    f"(Unread notifications: {h.get('your_account', {}).get('unread_notification_count')})")
+        for a in fresh:
+            seen[a.get("post_id")] = str(a.get("latest_at"))
+        state["posts"] = seen
+        _moltbook_save_state(state)
+
+async def _moltbook_poll_loop() -> None:
+    # small initial delay so startup isn't blocked
+    await asyncio.sleep(20)
+    while True:
+        try:
+            await asyncio.to_thread(moltbook_check)
+        except Exception:
+            pass
+        await asyncio.sleep(max(5, MOLTBOOK_POLL_MINUTES) * 60)
 
 # ----------------------------------------------------------------------------
 # Automated checks (no human) — run synchronously, sign, return completed.
@@ -814,7 +881,16 @@ def agent_verify(agent: str, public_key: str = "", message: str = "", signature:
 
 _mcp_app = _mcp.http_app(path="/mcp")   # internal route is exactly /mcp (no trailing-slash redirect)
 
-app = FastAPI(title=BRAND, version="0.2.0", lifespan=_mcp_app.lifespan)
+@asynccontextmanager
+async def _app_lifespan(app):
+    # Start the Moltbook activity poller (if configured) alongside the MCP lifespan.
+    poll_task = asyncio.create_task(_moltbook_poll_loop()) if MOLTBOOK_API_KEY else None
+    async with _mcp_app.lifespan(app):
+        yield
+    if poll_task:
+        poll_task.cancel()
+
+app = FastAPI(title=BRAND, version="0.2.0", lifespan=_app_lifespan)
 # Attach the MCP route(s) directly (instead of app.mount) so /mcp works without a redirect.
 for _r in _mcp_app.routes:
     app.router.routes.append(_r)
