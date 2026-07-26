@@ -14,8 +14,8 @@ Need a fact or an entity confirmed by a real human before you act on it? Attestl
 returns a cryptographically signed verdict (confirmed / refuted / uncertain) with
 evidence. Pay per check in USDC via x402. Signed with ed25519 — verify it yourself.
 
-- `entity_check` — does this business/entity exist and match these details? — 8 USDC
-- `claim_check` — is this factual claim/URL true? — 8 USDC
+- `entity_check` — does this business/entity exist and match these details? — 4 USDC (launch pricing)
+- `claim_check` — is this factual claim/URL true? — 4 USDC (launch pricing)
 - Turnaround: usually a few hours (human-reviewed)
 - Endpoint: `POST https://attestly.co/v1/verify`
 - Manifest + public key: `GET https://attestly.co/`
@@ -31,11 +31,11 @@ evidence. Pay per check in USDC via x402. Signed with ed25519 — verify it your
   "summary": "White-glove human verification for AI agents, returned as a signed attestation.",
   "payment": { "protocol": "x402", "network": "base", "asset": "USDC" },
   "services": [
-    { "id": "entity_check", "price_usd": 8.00,
+    { "id": "entity_check", "price_usd": 4.00,
       "input": { "business": "string", "state": "string", "claim": "string" },
       "output": { "verdict": "confirmed|refuted|uncertain", "summary": "string",
                   "evidence": "array", "confidence": "0-100", "signature": "ed25519 hex" } },
-    { "id": "claim_check", "price_usd": 8.00,
+    { "id": "claim_check", "price_usd": 4.00,
       "input": { "claim": "string", "url": "string (optional)" },
       "output": { "verdict": "confirmed|refuted|uncertain", "summary": "string",
                   "evidence": "array", "confidence": "0-100", "signature": "ed25519 hex" } }

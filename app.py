@@ -59,12 +59,12 @@ SERVICES = {
     "entity_check": {
         "title": "Human-verified entity check",
         "description": "A real human confirms whether a business/entity exists and matches the details you provide, with evidence and a signed verdict.",
-        "price_usd": 8.00,
+        "price_usd": 4.00,
     },
     "claim_check": {
         "title": "Human-verified claim check",
         "description": "A real human checks a factual claim or URL against real sources and returns confirmed / refuted / uncertain, with evidence and a signed verdict.",
-        "price_usd": 8.00,
+        "price_usd": 4.00,
     },
 }
 
@@ -460,6 +460,7 @@ def home():
         <div style="font-weight:700;font-size:18px">{v['title']}</div>
         <div style="color:#555;margin:8px 0">{v['description']}</div>
         <div style="font-size:22px;font-weight:700;color:#2F5496">${v['price_usd']:.0f}<span style="font-size:13px;color:#888;font-weight:400"> / check</span></div>
+        <div style="display:inline-block;margin-top:6px;background:#eaf1fb;color:#2F5496;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:999px">Launch pricing</div>
         </div>""" for v in SERVICES.values())
     return HTMLResponse(f"""<!doctype html><meta charset=utf-8><title>{BRAND}</title>
     <meta name=viewport content="width=device-width,initial-scale=1">
