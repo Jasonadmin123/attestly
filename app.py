@@ -106,12 +106,13 @@ def _cdp_auth_provider():
     from urllib.parse import urlparse
     u = urlparse(_FAC_URL); host = u.netloc; base = u.path.rstrip("/")
     def _headers():
-        def hdr(op):
+        def hdr(op, method):
             return get_auth_headers(GetAuthHeadersOptions(
                 api_key_id=CDP_API_KEY_ID, api_key_secret=CDP_API_KEY_SECRET,
-                request_method="POST", request_host=host, request_path=f"{base}/{op}"))
-        return {"verify": hdr("verify"), "settle": hdr("settle"),
-                "supported": hdr("supported"), "bazaar": {}}
+                request_method=method, request_host=host, request_path=f"{base}/{op}"))
+        # Methods must match the client's actual requests: verify/settle POST, supported GET.
+        return {"verify": hdr("verify", "POST"), "settle": hdr("settle", "POST"),
+                "supported": hdr("supported", "GET"), "bazaar": {}}
     return _AuthProvider(_headers)
 
 def _facilitator():
