@@ -23,13 +23,19 @@ Run:
 """
 
 import os
+import re
+import ssl
+import socket
 import json
+import hashlib
 import sqlite3
 import secrets
 from datetime import datetime, timezone
 from contextlib import closing
 
 import httpx
+import whois
+import dns.resolver
 from fastmcp import FastMCP
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
@@ -54,6 +60,29 @@ CONTACT_EMAIL  = os.environ.get("CONTACT_EMAIL", "you@yourdomain.com")
 RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")             # email alerts on new jobs
 ALERT_EMAIL    = os.environ.get("ALERT_EMAIL", "jason@theleadforge.com")
 ALERT_FROM     = os.environ.get("ALERT_FROM", "Attestly <onboarding@resend.dev>")
+BASESCAN_API_KEY = os.environ.get("BASESCAN_API_KEY", "")          # optional: wallet age signal
+
+# Automated-check config. Each network has a list of public RPC endpoints tried in
+# order — if one blocks/rate-limits, the next is tried. Override the first with env.
+RPC_URLS = {
+    "base": [os.environ.get("BASE_RPC_URL", "https://mainnet.base.org"),
+             "https://base.llamarpc.com", "https://base-rpc.publicnode.com",
+             "https://base.drpc.org"],
+    "ethereum": [os.environ.get("ETH_RPC_URL", "https://eth.llamarpc.com"),
+                 "https://ethereum-rpc.publicnode.com", "https://cloudflare-eth.com",
+                 "https://eth.drpc.org"],
+}
+OFAC_LIST_URL = os.environ.get(
+    "OFAC_LIST_URL",
+    "https://raw.githubusercontent.com/0xB10C/ofac-sanctioned-digital-currency-addresses/lists/sanctioned_addresses_ETH.txt",
+)
+DISPOSABLE_DOMAINS = {
+    "mailinator.com", "guerrillamail.com", "10minutemail.com", "tempmail.com",
+    "temp-mail.org", "yopmail.com", "throwawaymail.com", "getnada.com", "trashmail.com",
+    "sharklasers.com", "maildrop.cc", "dispostable.com", "fakeinbox.com", "mailnesia.com",
+    "mohmal.com", "emailondeck.com", "spam4.me", "grr.la", "guerrillamailblock.com",
+}
+_OFAC_CACHE = {"addrs": set(), "fetched_at": None}
 
 SERVICES = {
     "entity_check": {
@@ -65,6 +94,26 @@ SERVICES = {
         "title": "Human-verified claim check",
         "description": "A real human checks a factual claim or URL against real sources and returns confirmed / refuted / uncertain, with evidence and a signed verdict.",
         "price_usd": 4.00,
+    },
+    "notarize": {
+        "title": "Content notarization (signed timestamp)",
+        "description": "Submit content or a SHA-256 hash; get an instant ed25519-signed proof it existed at this time.",
+        "price_usd": 0.50, "auto": True,
+    },
+    "domain_check": {
+        "title": "Domain & website verification",
+        "description": "Instant automated check: does the domain resolve, is TLS valid, how old is it, registrar, reachability.",
+        "price_usd": 0.50, "auto": True,
+    },
+    "email_check": {
+        "title": "Email verification",
+        "description": "Instant automated check: syntax, MX records, disposable-domain detection, deliverability signal.",
+        "price_usd": 0.50, "auto": True,
+    },
+    "wallet_screen": {
+        "title": "Crypto wallet risk & sanctions screening",
+        "description": "Instant automated screen of an EVM address against OFAC sanctions + on-chain activity. Know your counterparty before you pay.",
+        "price_usd": 1.00, "auto": True,
     },
 }
 
@@ -181,6 +230,186 @@ def notify_new_job(att_id: str, service: str) -> None:
         pass
 
 # ----------------------------------------------------------------------------
+# Automated checks (no human) — run synchronously, sign, return completed.
+# ----------------------------------------------------------------------------
+def finalize_auto(service: str, subject: dict, verdict: str, confidence: int,
+                  summary: str, evidence=None, data=None) -> dict:
+    """Create an already-completed, signed attestation for an automated check."""
+    evidence = evidence or []
+    att_id = "at_" + secrets.token_hex(8)
+    now = now_iso()
+    with closing(db()) as conn:
+        conn.execute(
+            "INSERT INTO attestations (id,service,subject,status,verdict,summary,evidence,confidence,payment_status,created_at,completed_at,issuer) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (att_id, service, json.dumps(subject), "completed", verdict, summary,
+             json.dumps(evidence), confidence, "auto", now, now, "Attestly automated check"))
+        conn.commit()
+        row = conn.execute("SELECT * FROM attestations WHERE id=?", (att_id,)).fetchone()
+        sig = SIGNING_KEY.sign(canonical_payload(row).encode(), encoder=HexEncoder).signature.decode()
+        conn.execute("UPDATE attestations SET signature=? WHERE id=?", (sig, att_id))
+        conn.commit()
+    return {"attestation_id": att_id, "status": "completed", "verdict": verdict,
+            "confidence": confidence, "summary": summary, "evidence": evidence,
+            "data": data or {}, "signature": sig, "public_key": PUBLIC_KEY_HEX,
+            "public_url": f"{BASE_URL}/a/{att_id}"}
+
+def _ofac_addresses() -> set:
+    """Fetch + cache the OFAC sanctioned crypto address list (daily). Fails safe to cached/empty."""
+    from datetime import date
+    if _OFAC_CACHE["fetched_at"] == str(date.today()) and _OFAC_CACHE["addrs"]:
+        return _OFAC_CACHE["addrs"]
+    try:
+        r = httpx.get(OFAC_LIST_URL, timeout=10)
+        if r.status_code == 200:
+            addrs = {ln.strip().lower() for ln in r.text.splitlines() if ln.strip().startswith("0x")}
+            if addrs:
+                _OFAC_CACHE["addrs"] = addrs
+                _OFAC_CACHE["fetched_at"] = str(date.today())
+    except Exception:
+        pass
+    return _OFAC_CACHE["addrs"]
+
+def run_notarize(subject: dict):
+    content = subject.get("content")
+    sha = (subject.get("sha256") or "").lower().strip()
+    if content:
+        sha = hashlib.sha256(str(content).encode("utf-8")).hexdigest()
+    if not re.fullmatch(r"[0-9a-f]{64}", sha or ""):
+        raise ValueError("provide 'content' to hash, or a valid 64-char hex 'sha256'")
+    summary = f"SHA-256 {sha[:16]}… notarized — existence attested at {now_iso()}."
+    return ("notarized", 100, summary, [{"label": "sha256", "note": sha}],
+            {"sha256": sha}, {"sha256": sha})   # store only the hash, never raw content
+
+def run_domain_check(subject: dict):
+    domain = (subject.get("domain") or "").strip().lower()
+    domain = re.sub(r"^https?://", "", domain).split("/")[0].split(":")[0]
+    if not domain or "." not in domain:
+        raise ValueError("provide a 'domain', e.g. example.com")
+    resolves = mx = ssl_valid = False
+    age_days = created = registrar = ssl_issuer = ssl_expires = http_status = None
+    try:
+        dns.resolver.resolve(domain, "A", lifetime=5); resolves = True
+    except Exception: pass
+    try:
+        dns.resolver.resolve(domain, "MX", lifetime=5); mx = True
+    except Exception: pass
+    try:
+        w = whois.whois(domain)
+        cd = w.creation_date
+        if isinstance(cd, list): cd = cd[0] if cd else None
+        if cd and hasattr(cd, "year"):
+            created = str(cd)
+            try: age_days = (datetime.now() - cd.replace(tzinfo=None)).days
+            except Exception: age_days = None
+        registrar = str(w.registrar) if getattr(w, "registrar", None) else None
+    except Exception: pass
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((domain, 443), timeout=6) as s:
+            with ctx.wrap_socket(s, server_hostname=domain) as ss:
+                cert = ss.getpeercert(); ssl_valid = True
+                ssl_expires = cert.get("notAfter")
+                ssl_issuer = dict(x[0] for x in cert.get("issuer", [])).get("organizationName")
+    except Exception: pass
+    for scheme in ("https", "http"):
+        try:
+            http_status = httpx.get(f"{scheme}://{domain}", timeout=6, follow_redirects=True).status_code
+            break
+        except Exception: pass
+    signals = sum([resolves, ssl_valid, bool(http_status and http_status < 500)])
+    if not resolves:
+        verdict, conf = "refuted", 90
+    elif signals >= 3:
+        verdict, conf = "confirmed", 90
+    else:
+        verdict, conf = "uncertain", 60
+    summary = (f"{domain}: resolves={resolves}, TLS={'valid' if ssl_valid else 'no/invalid'}, "
+               f"HTTP={http_status}, age={age_days}d, registrar={registrar}.")
+    data = {"domain": domain, "resolves": resolves, "mx_found": mx, "age_days": age_days,
+            "created": created, "registrar": registrar, "ssl_valid": ssl_valid,
+            "ssl_issuer": ssl_issuer, "ssl_expires": ssl_expires, "http_status": http_status}
+    evidence = [{"label": "dns", "note": f"A={resolves}, MX={mx}"},
+                {"label": "tls", "note": f"valid={ssl_valid}, issuer={ssl_issuer}, expires={ssl_expires}"},
+                {"label": "whois", "note": f"created={created}, registrar={registrar}"},
+                {"label": "http", "note": f"status={http_status}"}]
+    return (verdict, conf, summary, evidence, data, {"domain": domain})
+
+def run_email_check(subject: dict):
+    email = (subject.get("email") or "").strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email):
+        return ("refuted", 95, f"'{email}' is not a valid email address.",
+                [{"label": "syntax", "note": "invalid"}],
+                {"email": email, "syntax_valid": False}, {"email": email})
+    domain = email.split("@")[1].lower()
+    mx = False
+    try:
+        mx = len(dns.resolver.resolve(domain, "MX", lifetime=5)) > 0
+    except Exception: pass
+    disposable = domain in DISPOSABLE_DOMAINS
+    if not mx:
+        verdict, conf, guess = "refuted", 85, "undeliverable (no MX records)"
+    elif disposable:
+        verdict, conf, guess = "uncertain", 70, "disposable/temporary address"
+    else:
+        verdict, conf, guess = "confirmed", 80, "likely deliverable"
+    summary = f"{email}: syntax ok, MX={'found' if mx else 'none'}, disposable={disposable} → {guess}."
+    data = {"email": email, "syntax_valid": True, "domain": domain, "mx_found": mx,
+            "disposable": disposable, "deliverable_guess": guess}
+    evidence = [{"label": "mx", "note": str(mx)}, {"label": "disposable", "note": str(disposable)}]
+    return (verdict, conf, summary, evidence, data, {"email": email})
+
+def run_wallet_screen(subject: dict):
+    addr = (subject.get("address") or "").strip()
+    network = (subject.get("network") or "base").lower()
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", addr):
+        raise ValueError("provide a valid EVM 'address' (0x + 40 hex chars)")
+    sanctioned = addr.lower() in _ofac_addresses()
+    balance = tx_count = None
+    endpoints = RPC_URLS.get(network, RPC_URLS["base"])
+    for rpc in endpoints:
+        try:
+            bal = httpx.post(rpc, json={"jsonrpc": "2.0", "id": 1, "method": "eth_getBalance",
+                                        "params": [addr, "latest"]}, timeout=8).json().get("result")
+            nc = httpx.post(rpc, json={"jsonrpc": "2.0", "id": 1, "method": "eth_getTransactionCount",
+                                       "params": [addr, "latest"]}, timeout=8).json().get("result")
+            if bal is not None or nc is not None:
+                if bal is not None: balance = int(bal, 16) / 1e18
+                if nc is not None: tx_count = int(nc, 16)
+                break   # got a working endpoint
+        except Exception:
+            continue
+    flags = []
+    if sanctioned:
+        verdict, conf, risk = "refuted", 99, "high"; flags.append("OFAC-sanctioned")
+    elif tx_count is None:
+        verdict, conf, risk = "uncertain", 50, "unknown"; flags.append("could not read chain")
+    elif tx_count == 0:
+        verdict, conf, risk = "uncertain", 70, "medium"; flags.append("no on-chain history")
+    else:
+        verdict, conf, risk = "confirmed", 80, "low"
+    summary = (f"{addr} ({network}): sanctioned={sanctioned}, balance={balance}, "
+               f"tx_count={tx_count} → risk {risk}.")
+    data = {"address": addr, "network": network, "sanctioned": sanctioned,
+            "sanctions_source": "OFAC SDN crypto list", "sanctions_snapshot": _OFAC_CACHE.get("fetched_at"),
+            "balance": balance, "tx_count": tx_count, "risk_level": risk, "flags": flags}
+    evidence = [{"label": "sanctions", "note": f"OFAC match={sanctioned}"},
+                {"label": "onchain", "note": f"balance={balance}, tx_count={tx_count}"}]
+    return (verdict, conf, summary, evidence, data, {"address": addr, "network": network})
+
+AUTO_RUNNERS = {
+    "notarize": run_notarize,
+    "domain_check": run_domain_check,
+    "email_check": run_email_check,
+    "wallet_screen": run_wallet_screen,
+}
+
+def run_auto(service: str, subject: dict) -> dict:
+    """Run an automated check and return a signed, completed attestation."""
+    verdict, conf, summary, evidence, data, stored_subject = AUTO_RUNNERS[service](subject)
+    return finalize_auto(service, stored_subject, verdict, conf, summary, evidence, data)
+
+# ----------------------------------------------------------------------------
 # Hosted MCP server (remote, callable at /mcp) — so any MCP agent can use Attestly
 # by URL, no install. Tools reuse the internal logic below.
 # ----------------------------------------------------------------------------
@@ -232,6 +461,47 @@ def get_attestation(attestation_id: str) -> dict:
                     "signature": row["signature"], "public_key": PUBLIC_KEY_HEX})
     return out
 
+def _auto_tool(service: str, subject: dict, payment: str):
+    """Shared body for the automated MCP tools: gate on payment, run, return signed result."""
+    accepted, _ = check_payment(payment or None, service)
+    if not accepted:
+        svc = SERVICES[service]
+        return {"payment_required": {"protocol": "x402", "network": PAY_NETWORK, "asset": PAY_ASSET,
+                                     "amount": f"{svc['price_usd']:.2f}", "payTo": PAYTO_ADDRESS},
+                "note": f"Pay {svc['price_usd']:.2f} USDC, then call again with the payment proof. Instant, signed result on payment."}
+    try:
+        return run_auto(service, subject)
+    except ValueError as e:
+        return {"error": str(e)}
+
+@_mcp.tool
+def notarize(content: str = "", sha256: str = "", payment: str = "") -> dict:
+    """Instantly notarize content: get an ed25519-signed proof it existed at this time. 0.50 USDC.
+    Provide 'content' to hash (only the hash is stored, never the raw content), or a 64-char hex 'sha256'.
+    payment: your x402 proof. Omit to receive payment requirements first. Proves existence at time T, not authorship."""
+    return _auto_tool("notarize", {"content": content, "sha256": sha256}, payment)
+
+@_mcp.tool
+def domain_check(domain: str, payment: str = "") -> dict:
+    """Instantly verify a domain/website: does it resolve, is TLS valid, how old, registrar, reachable. 0.50 USDC.
+    Returns a signed verdict (confirmed/refuted/uncertain) with evidence. payment: your x402 proof; omit to get requirements first.
+    Informational — 'resolves + valid cert' is not proof the business is trustworthy."""
+    return _auto_tool("domain_check", {"domain": domain}, payment)
+
+@_mcp.tool
+def email_check(email: str, payment: str = "") -> dict:
+    """Instantly verify an email address: syntax, MX records, disposable-domain detection, deliverability signal. 0.50 USDC.
+    Returns a signed verdict with evidence. payment: your x402 proof; omit to get requirements first.
+    Deliverability is best-effort; a 'valid' result is not a guarantee of inbox delivery."""
+    return _auto_tool("email_check", {"email": email}, payment)
+
+@_mcp.tool
+def wallet_screen(address: str, network: str = "base", payment: str = "") -> dict:
+    """Instantly screen an EVM address against OFAC sanctions + on-chain activity before you pay a counterparty. 1.00 USDC.
+    Returns a signed verdict with risk level and evidence. network: 'base' or 'ethereum'. payment: your x402 proof; omit to get requirements first.
+    Informational screening only — NOT compliance, legal, or financial advice, and not 'KYC-certified'."""
+    return _auto_tool("wallet_screen", {"address": address, "network": network}, payment)
+
 _mcp_app = _mcp.http_app(path="/mcp")   # internal route is exactly /mcp (no trailing-slash redirect)
 
 app = FastAPI(title=BRAND, version="0.2.0", lifespan=_mcp_app.lifespan)
@@ -247,7 +517,7 @@ def healthz():
 def manifest():
     return {
         "name": BRAND, "type": "a2a-verification-service",
-        "summary": "White-glove human verification for AI agents. Pay a small fee, a real human verifies, you get a cryptographically signed attestation.",
+        "summary": "The trust layer for AI agents: instant automated checks (wallet/sanctions, domain, email, notarization) plus human-verified attestations — all cryptographically signed (ed25519). Pay per check in USDC via x402.",
         "public_key": PUBLIC_KEY_HEX,
         "verify_signature": "ed25519 over the canonical JSON at /v1/attestations/{id}?canonical=1",
         "payment": {"protocol": "x402", "network": PAY_NETWORK, "asset": PAY_ASSET, "pay_to": PAYTO_ADDRESS},
@@ -269,7 +539,7 @@ def _agent_card():
     return {
         "protocolVersion": "0.3.0",
         "name": BRAND,
-        "description": "White-glove human verification for AI agents. Submit a fact or entity; a real human verifies it and returns a cryptographically signed (ed25519) attestation. Pay per check in USDC via x402.",
+        "description": "The trust layer for AI agents. Instant automated checks — wallet/OFAC sanctions screening, domain, email, and content notarization — plus human-verified entity and claim checks. Every result is a cryptographically signed (ed25519) attestation. Pay per check in USDC via x402.",
         "url": BASE_URL,
         "preferredTransport": "JSONRPC",
         "version": "0.2.0",
@@ -287,6 +557,22 @@ def _agent_card():
              "description": "A real human checks a factual claim or URL against real sources; returns confirmed/refuted/uncertain with evidence. Price: %.2f USDC." % SERVICES["claim_check"]["price_usd"],
              "tags": ["verification", "fact-check", "trust", "x402"],
              "examples": ["Verify: 'https://example.com is the official site of Example Corp.'"]},
+            {"id": "wallet-screen", "name": "Wallet risk & sanctions screening (instant)",
+             "description": "Instantly screen an EVM address against OFAC sanctions + on-chain activity; returns a signed risk verdict. Informational, not compliance advice. Price: %.2f USDC." % SERVICES["wallet_screen"]["price_usd"],
+             "tags": ["verification", "wallet", "sanctions", "ofac", "risk", "x402", "instant"],
+             "examples": ["Screen 0x1234...abcd on base before I send USDC."]},
+            {"id": "domain-check", "name": "Domain & website verification (instant)",
+             "description": "Instantly check whether a domain resolves, has valid TLS, its age and registrar, and reachability; returns a signed verdict. Price: %.2f USDC." % SERVICES["domain_check"]["price_usd"],
+             "tags": ["verification", "domain", "website", "tls", "x402", "instant"],
+             "examples": ["Is stripe.com a real, resolving site with valid TLS?"]},
+            {"id": "email-check", "name": "Email verification (instant)",
+             "description": "Instantly check an email's syntax, MX records, disposable-domain status, and deliverability signal; returns a signed verdict. Price: %.2f USDC." % SERVICES["email_check"]["price_usd"],
+             "tags": ["verification", "email", "deliverability", "x402", "instant"],
+             "examples": ["Is user@example.com a deliverable, non-disposable address?"]},
+            {"id": "notarize", "name": "Content notarization (instant)",
+             "description": "Instantly notarize content or a hash — an ed25519-signed proof it existed at time T. Proves existence, not authorship. Price: %.2f USDC." % SERVICES["notarize"]["price_usd"],
+             "tags": ["notary", "timestamp", "hash", "proof", "x402", "instant"],
+             "examples": ["Notarize the SHA-256 of this agreement text."]},
         ],
     }
 
@@ -299,18 +585,24 @@ def agent_card():
 def llms_txt():
     return f"""# {BRAND}
 
-> Human verification for AI agents. Submit a fact or an entity; a real human verifies it and returns a cryptographically signed attestation. Pay per check in USDC via the x402 protocol.
+> The trust layer for AI agents. Instant automated checks plus human-verified attestations, all cryptographically signed (ed25519). Pay per check in USDC via the x402 protocol. Verdicts: confirmed / refuted / uncertain, with evidence and a confidence score.
 
-## What it does
+## Instant automated checks (signed result in the same response)
+- wallet_screen (${SERVICES['wallet_screen']['price_usd']:.2f} USDC): screen an EVM address vs OFAC sanctions + on-chain activity before you pay a counterparty. Informational, not compliance advice.
+- domain_check (${SERVICES['domain_check']['price_usd']:.2f} USDC): does a domain resolve, valid TLS, age, registrar, reachability.
+- email_check (${SERVICES['email_check']['price_usd']:.2f} USDC): syntax, MX records, disposable-domain detection, deliverability signal.
+- notarize (${SERVICES['notarize']['price_usd']:.2f} USDC): signed proof that content (or its hash) existed at time T. Existence, not authorship.
+
+## Human-verified checks (reviewed by a real person, usually within hours)
 - entity_check (${SERVICES['entity_check']['price_usd']:.0f} USDC): confirm a business/entity exists and matches given details.
 - claim_check (${SERVICES['claim_check']['price_usd']:.0f} USDC): check a factual claim or URL against real sources.
-Every result is an ed25519-signed attestation anyone can verify. Verdicts: confirmed / refuted / uncertain, with evidence and a confidence score.
 
 ## How an agent uses it
-1. POST {BASE_URL}/v1/verify  body: {{"service":"entity_check","subject":{{...}}}}
+1. POST {BASE_URL}/v1/verify  body: {{"service":"wallet_screen","subject":{{"address":"0x..."}}}}
 2. Receive HTTP 402 with x402 payment requirements. Pay in USDC, retry with header X-PAYMENT.
-3. Poll GET {BASE_URL}/v1/attestations/{{id}} until status == completed.
+3. Automated services return the signed, completed attestation immediately. Human services return a job id — poll GET {BASE_URL}/v1/attestations/{{id}} until status == completed.
 4. Verify the ed25519 signature against the public key in the manifest.
+Or call the hosted MCP server at {BASE_URL}/mcp (tools: wallet_screen, domain_check, email_check, notarize, request_verification, get_attestation, get_services).
 
 ## Links
 - Manifest (JSON): {BASE_URL}/
@@ -331,6 +623,12 @@ def verify(req: VerifyRequest, x_payment: str | None = Header(default=None)):
     accepted, pay_status = check_payment(x_payment, req.service)
     if not accepted:
         return x402_challenge(req.service)
+    # Automated services run synchronously and return a signed, completed attestation now.
+    if SERVICES[req.service].get("auto"):
+        try:
+            return run_auto(req.service, req.subject)
+        except ValueError as e:
+            raise HTTPException(400, str(e))
     att_id = "at_" + secrets.token_hex(8)
     with closing(db()) as conn:
         conn.execute("INSERT INTO attestations (id,service,subject,status,payment_ref,payment_status,created_at) VALUES (?,?,?,?,?,?,?)",
@@ -455,30 +753,45 @@ def public_page(att_id: str):
 # ---- Human landing page ----
 @app.get("/home", response_class=HTMLResponse)
 def home():
-    cards = "".join(
-        f"""<div style="border:1px solid #e5e5e5;border-radius:12px;padding:20px;flex:1;min-width:240px">
+    def card(v):
+        auto = v.get("auto")
+        badge_bg, badge_fg, badge = ("#e6f6ec", "#0a7d2c", "Instant · automated") if auto else ("#fff1e6", "#b5651d", "Human · usually ~hours")
+        return f"""<div style="border:1px solid #e5e5e5;border-radius:12px;padding:20px;flex:1;min-width:240px">
+        <div style="display:inline-block;margin-bottom:8px;background:{badge_bg};color:{badge_fg};font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:999px">{badge}</div>
         <div style="font-weight:700;font-size:18px">{v['title']}</div>
         <div style="color:#555;margin:8px 0">{v['description']}</div>
-        <div style="font-size:22px;font-weight:700;color:#2F5496">${v['price_usd']:.0f}<span style="font-size:13px;color:#888;font-weight:400"> / check</span></div>
-        <div style="display:inline-block;margin-top:6px;background:#eaf1fb;color:#2F5496;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:999px">Launch pricing</div>
-        </div>""" for v in SERVICES.values())
+        <div style="font-size:22px;font-weight:700;color:#2F5496">${v['price_usd']:.2f}<span style="font-size:13px;color:#888;font-weight:400"> / check</span></div>
+        </div>"""
+    auto_cards = "".join(card(v) for v in SERVICES.values() if v.get("auto"))
+    human_cards = "".join(card(v) for v in SERVICES.values() if not v.get("auto"))
     return HTMLResponse(f"""<!doctype html><meta charset=utf-8><title>{BRAND}</title>
     <meta name=viewport content="width=device-width,initial-scale=1">
-    <body style="font-family:system-ui;max-width:860px;margin:0 auto;padding:48px 20px;color:#1a1a1a;line-height:1.55">
+    <body style="font-family:system-ui;max-width:900px;margin:0 auto;padding:48px 20px;color:#1a1a1a;line-height:1.55">
       <div style="font-size:13px;letter-spacing:.1em;text-transform:uppercase;color:#2F5496;font-weight:700">{BRAND}</div>
-      <h1 style="font-size:40px;margin:.1em 0 .2em">Human verification for AI agents.</h1>
-      <p style="font-size:20px;color:#444">Your agent can pay software, but it can't buy trustworthy human judgment.
-      {BRAND} puts a real person in the loop: pay per check in USDC, a human verifies, and you get back a
-      cryptographically signed attestation you can verify and keep.</p>
-      <div style="display:flex;gap:16px;flex-wrap:wrap;margin:28px 0">{cards}</div>
-      <h3>How it works</h3>
-      <ol><li>Your agent calls <code>POST /v1/verify</code> and pays via x402 (USDC).</li>
-      <li>A real human verifies against primary sources.</li>
+      <h1 style="font-size:40px;margin:.1em 0 .2em">The trust layer for AI agents.</h1>
+      <p style="font-size:20px;color:#444">Agents can pay for things now — but they can't tell what's actually true.
+      {BRAND} gives them signed answers: <b>instant automated checks</b> for wallets, domains, emails and content,
+      plus <b>human-verified attestations</b> for the calls that need judgment. Pay per check in USDC. Every result is
+      cryptographically signed — verify it yourself.</p>
+
+      <h3 style="margin-top:34px">Instant automated checks</h3>
+      <p style="color:#666;margin-top:2px">Signed result in the same response — no waiting, no human.</p>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;margin:14px 0 30px">{auto_cards}</div>
+
+      <h3>Human-verified checks</h3>
+      <p style="color:#666;margin-top:2px">A real person verifies against primary sources — for the calls automation can't make.</p>
+      <div style="display:flex;gap:16px;flex-wrap:wrap;margin:14px 0 8px">{human_cards}</div>
+      <div style="display:inline-block;background:#eaf1fb;color:#2F5496;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:999px">Launch pricing — all services</div>
+
+      <h3 style="margin-top:32px">How it works</h3>
+      <ol><li>Your agent calls <code>POST /v1/verify</code> (or the hosted MCP server at <code>/mcp</code>) and pays via x402 (USDC).</li>
+      <li>Automated checks run instantly; human checks are verified against primary sources.</li>
       <li>You get a signed verdict (confirmed / refuted / uncertain) with evidence.</li>
-      <li>Anyone can verify the signature — trust, provable.</li></ol>
+      <li>Anyone can verify the ed25519 signature — trust, provable.</li></ol>
       <p style="margin-top:28px"><a href="/" style="color:#2F5496">Agent manifest (JSON)</a> ·
+      <a href="/mcp" style="color:#2F5496">MCP endpoint</a> ·
       <a href="mailto:{CONTACT_EMAIL}" style="color:#2F5496">Contact</a></p>
-      <p style="color:#999;font-size:13px;margin-top:40px">{BRAND} verifies facts and entities. It does not provide legal, medical, or financial advice.</p>
+      <p style="color:#999;font-size:13px;margin-top:40px">{BRAND} returns informational, signed checks — it verifies facts and entities and does not provide legal, medical, or financial advice. Wallet screening is informational only, not compliance certification.</p>
     </body>""")
 
 # ---- Admin console (browser) ----
