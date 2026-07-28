@@ -31,15 +31,16 @@ import asyncio
 import hashlib
 import sqlite3
 import secrets
+import time as _time
 from datetime import datetime, timezone, timedelta
 from contextlib import closing, asynccontextmanager
-from collections import defaultdict
+from collections import defaultdict, deque
 
 import httpx
 import whois
 import dns.resolver
 from fastmcp import FastMCP
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Request
 from fastapi.responses import JSONResponse, HTMLResponse, PlainTextResponse
 from pydantic import BaseModel, Field
 from nacl.signing import SigningKey, VerifyKey
@@ -214,6 +215,33 @@ SERVICES = {
     },
 }
 
+# --- Free-tier flip (bureau strategy: give the automated checks away to accumulate the
+#     data asset — every check becomes a row in an agent's file). Flip back by setting
+#     ALL_AUTO_FREE=false to restore the paid prices above. Human checks always stay paid.
+ALL_AUTO_FREE = os.environ.get("ALL_AUTO_FREE", "true").lower() == "true"
+if ALL_AUTO_FREE:
+    for _k, _v in SERVICES.items():
+        if _v.get("auto"):
+            _v["price_usd"] = 0.00
+            _v["free"] = True
+
+# --- Cost / abuse guardrails (so "free" can never turn into "expensive" or "abused").
+#     All in-memory + env-tunable; no external cost. Enforced centrally in run_auto().
+AUTO_CHECKS_ENABLED = os.environ.get("AUTO_CHECKS_ENABLED", "true").lower() == "true"  # master kill-switch
+FREE_DAILY_CEILING  = int(os.environ.get("FREE_DAILY_CEILING", "3000"))   # max automated checks/day, platform-wide
+RATE_PER_MIN        = int(os.environ.get("RATE_PER_MIN", "30"))           # per-IP requests/min on /v1/verify
+CACHE_TTL_MIN       = int(os.environ.get("CACHE_TTL_MIN", "60"))          # dedupe identical (service,subject) lookups
+SPIKE_ALERT_AT      = int(os.environ.get("SPIKE_ALERT_AT", "1000"))       # email once/day when daily count crosses this
+_AUTO_CACHE: dict = {}                    # (service, subject_key) -> (result_dict, epoch_ts)
+_DAILY = {"day": None, "count": 0, "alerted": False}
+_RATE_HITS: dict = defaultdict(deque)     # ip -> deque[epoch_ts]
+
+class GuardrailBlock(Exception):
+    """Raised to short-circuit an automated check without an error stack (kill-switch / daily ceiling)."""
+    def __init__(self, code: str, message: str, status: int = 429):
+        self.code = code; self.message = message; self.status = status
+        super().__init__(message)
+
 def pricing_notice(service_key: str | None = None) -> str:
     if service_key and SERVICES.get(service_key, {}).get("price_usd", 0) <= 0:
         return (f"This service is FREE during Attestly's introductory period (v{PRICING_VERSION}). "
@@ -280,6 +308,17 @@ def init_db():
                 confidence INTEGER, payment_ref TEXT, payment_status TEXT,
                 created_at TEXT NOT NULL, completed_at TEXT, issuer TEXT, signature TEXT
             )""")
+        # The "memory": one row per completed check, indexed by the subject being checked
+        # (wallet / agent / domain / email). This is the bureau file that compounds over time —
+        # the whole point of running the checks free. Stamps sell for pennies; files don't.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS agent_records (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject_key TEXT NOT NULL, subject_type TEXT NOT NULL,
+                service TEXT NOT NULL, verdict TEXT, confidence INTEGER, summary TEXT,
+                facts TEXT, attestation_id TEXT, payment_status TEXT, created_at TEXT NOT NULL
+            )""")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_agent_records_key ON agent_records(subject_key)")
         conn.commit()
 init_db()
 
@@ -485,6 +524,7 @@ def _metric_label(path: str, status: int) -> str | None:
         return "verify_other"
     if p.startswith("/a/"): return "attestation_view"       # public signed-result page
     if p.startswith("/v1/attestations"): return "attestation_api"
+    if p.startswith("/v1/profile"): return "profile_pull"    # someone queried an agent's file = bureau intent
     return None
 
 def _record_metric(path: str, status: int) -> None:
@@ -521,6 +561,94 @@ async def _metrics_flush_loop() -> None:
 # ----------------------------------------------------------------------------
 # Automated checks (no human) — run synchronously, sign, return completed.
 # ----------------------------------------------------------------------------
+# --- The memory: derive the subject identity a check is ABOUT, and file the row. -------------
+def _subject_key(service: str, subject: dict):
+    """The identity a check is about → (key, type). This is what the bureau file is indexed on."""
+    s = subject or {}
+    if service == "wallet_screen":
+        a = (s.get("address") or "").strip().lower();  return (a, "wallet") if a else (None, None)
+    if service == "agent_verify":
+        a = (s.get("agent") or "").strip().lower()
+        if a.startswith("http"):
+            try:
+                from urllib.parse import urlparse
+                a = urlparse(a).netloc.lower() or a
+            except Exception:
+                pass
+        return (a, "agent") if a else (None, None)
+    if service == "domain_check":
+        d = (s.get("domain") or "").strip().lower();   return (d, "domain") if d else (None, None)
+    if service == "email_check":
+        e = (s.get("email") or "").strip().lower();    return (e, "email") if e else (None, None)
+    if service == "notarize":
+        h = (s.get("sha256") or "").strip().lower();   return (h, "content") if h else (None, None)
+    return (None, None)
+
+def _record_agent(service, subject, verdict, confidence, summary, data, att_id, payment_status):
+    """Write one bureau row for the subject checked. Fails safe — never breaks a check."""
+    key, ktype = _subject_key(service, subject)
+    if not key:
+        return
+    try:
+        facts = json.dumps(data or {}, separators=(",", ":"))[:2000]
+        with closing(db()) as conn:
+            conn.execute(
+                "INSERT INTO agent_records (subject_key,subject_type,service,verdict,confidence,summary,facts,attestation_id,payment_status,created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (key, ktype, service, verdict, confidence, summary, facts, att_id, payment_status or "auto", now_iso()))
+            conn.commit()
+    except Exception:
+        pass
+
+# --- Guardrails: kill-switch, daily ceiling, per-IP rate limit, dedupe cache. In-memory, free. --
+def _ceiling_check_and_incr():
+    d = now_iso()[:10]
+    if _DAILY["day"] != d:
+        _DAILY["day"] = d; _DAILY["count"] = 0; _DAILY["alerted"] = False
+    if _DAILY["count"] >= FREE_DAILY_CEILING:
+        raise GuardrailBlock("free_capacity_reached",
+                             f"Free daily capacity ({FREE_DAILY_CEILING}) reached — retry tomorrow.", status=429)
+    _DAILY["count"] += 1
+    if (not _DAILY["alerted"]) and _DAILY["count"] >= SPIKE_ALERT_AT:
+        _DAILY["alerted"] = True
+        _send_email("Attestly ⚡ traffic spike",
+                    f"Automated checks today crossed {SPIKE_ALERT_AT} ({_DAILY['count']} so far; ceiling {FREE_DAILY_CEILING}). "
+                    f"No cost impact (no paid APIs), just a heads-up. Kill-switch: set AUTO_CHECKS_ENABLED=false to pause.")
+
+def _rate_ok(ip: str) -> bool:
+    if RATE_PER_MIN <= 0:
+        return True
+    now = _time.time(); dq = _RATE_HITS[ip]
+    while dq and now - dq[0] > 60:
+        dq.popleft()
+    if len(dq) >= RATE_PER_MIN:
+        return False
+    dq.append(now); return True
+
+def _cache_key(service: str, subject: dict) -> str:
+    """Dedupe on the FULL request (identity + all params), not just identity — a key-proof
+    agent_verify is a different question than a bare one, so they must not share a cache entry."""
+    try:
+        blob = json.dumps(subject or {}, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        blob = str(subject)
+    return service + ":" + hashlib.sha256(blob.encode()).hexdigest()[:32]
+
+def _cache_get(key):
+    if CACHE_TTL_MIN <= 0 or not key:
+        return None
+    hit = _AUTO_CACHE.get(key)
+    if not hit:
+        return None
+    result, ts = hit
+    if _time.time() - ts > CACHE_TTL_MIN * 60:
+        _AUTO_CACHE.pop(key, None); return None
+    out = dict(result); out["cached"] = True; return out
+
+def _cache_put(key, result):
+    if CACHE_TTL_MIN > 0 and key:
+        _AUTO_CACHE[key] = (result, _time.time())
+
 def finalize_auto(service: str, subject: dict, verdict: str, confidence: int,
                   summary: str, evidence=None, data=None,
                   payment_status: str = "auto", payment_ref: str | None = None) -> dict:
@@ -540,6 +668,8 @@ def finalize_auto(service: str, subject: dict, verdict: str, confidence: int,
         sig = SIGNING_KEY.sign(canonical_payload(row).encode(), encoder=HexEncoder).signature.decode()
         conn.execute("UPDATE attestations SET signature=? WHERE id=?", (sig, att_id))
         conn.commit()
+    # File the row in the subject's bureau record (the compounding data asset).
+    _record_agent(service, subject, verdict, confidence, summary, data, att_id, payment_status)
     if payment_status == "verified":
         notify_paid(att_id, service, payment_ref)   # real money settled
     return {"attestation_id": att_id, "status": "completed", "verdict": verdict,
@@ -824,10 +954,23 @@ AUTO_RUNNERS = {
 }
 
 def run_auto(service: str, subject: dict, payment_status: str = "auto", payment_ref: str | None = None) -> dict:
-    """Run an automated check and return a signed, completed attestation."""
+    """Run an automated check and return a signed, completed attestation.
+    Guardrails (kill-switch → dedupe cache → daily ceiling) are enforced here so BOTH the
+    HTTP and MCP paths are protected. Cache hits and disabled/ceiling blocks do no external work."""
+    if not AUTO_CHECKS_ENABLED:
+        raise GuardrailBlock("auto_disabled", "Automated checks are temporarily paused. Try again later.", status=503)
+    ckey = _cache_key(service, subject)
+    if service != "notarize":                      # notarize is pure local hashing — no need to cache
+        cached = _cache_get(ckey)
+        if cached is not None:
+            return cached
+    _ceiling_check_and_incr()
     verdict, conf, summary, evidence, data, stored_subject = AUTO_RUNNERS[service](subject)
-    return finalize_auto(service, stored_subject, verdict, conf, summary, evidence, data,
-                         payment_status=payment_status, payment_ref=payment_ref)
+    result = finalize_auto(service, stored_subject, verdict, conf, summary, evidence, data,
+                           payment_status=payment_status, payment_ref=payment_ref)
+    if service != "notarize":
+        _cache_put(ckey, result)
+    return result
 
 # ----------------------------------------------------------------------------
 # Hosted MCP server (remote, callable at /mcp) — so any MCP agent can use Attestly
@@ -893,6 +1036,8 @@ def _auto_tool(service: str, subject: dict, payment: str):
                 "note": f"Pay {svc['price_usd']:.2f} USDC, then call again with the payment proof. Instant, signed result on payment."}
     try:
         return run_auto(service, subject)
+    except GuardrailBlock as g:
+        return {"error": g.code, "message": g.message}
     except ValueError as e:
         return {"error": str(e)}
 
@@ -1104,9 +1249,15 @@ class VerifyRequest(BaseModel):
     subject: dict = Field(..., description="What to verify, e.g. {'business':'Acme LLC','state':'AZ','claim':'is registered'}")
 
 @app.post("/v1/verify")
-def verify(req: VerifyRequest, x_payment: str | None = Header(default=None)):
+def verify(req: VerifyRequest, request: Request, x_payment: str | None = Header(default=None)):
     if req.service not in SERVICES:
         raise HTTPException(400, f"unknown service '{req.service}'. See GET / for options.")
+    # Per-IP rate limit (behind Render's proxy, prefer the forwarded client IP).
+    ip = (request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+          or (request.client.host if request.client else "?"))
+    if not _rate_ok(ip):
+        return JSONResponse(status_code=429, content={
+            "error": "rate_limited", "message": f"Max {RATE_PER_MIN} requests/min per caller. Slow down and retry."})
     accepted, pay_status, tx_ref = check_payment(x_payment, req.service)
     if not accepted:
         return x402_challenge(req.service)
@@ -1114,6 +1265,8 @@ def verify(req: VerifyRequest, x_payment: str | None = Header(default=None)):
     if SERVICES[req.service].get("auto"):
         try:
             return run_auto(req.service, req.subject, payment_status=pay_status, payment_ref=tx_ref)
+        except GuardrailBlock as g:
+            return JSONResponse(status_code=g.status, content={"error": g.code, "message": g.message})
         except ValueError as e:
             raise HTTPException(400, str(e))
     att_id = "at_" + secrets.token_hex(8)
@@ -1146,6 +1299,29 @@ def get_attestation(att_id: str, canonical: int = 0):
                     "issued_at": row["completed_at"], "issuer": row["issuer"],
                     "signature": row["signature"], "public_key": PUBLIC_KEY_HEX})
     return out
+
+# ---- The file: an agent's accumulated track record (the bureau "pull") ----
+@app.get("/v1/profile/{subject_key:path}")
+def profile(subject_key: str):
+    """Pull the accumulated history Attestly holds on a subject (wallet / agent / domain / email).
+    This is the bureau file — thin today, deepening every time the subject is checked.
+    Informational signals over time, not a guarantee or a compliance clearance."""
+    key = (subject_key or "").strip().lower()
+    with closing(db()) as conn:
+        rows = conn.execute("SELECT * FROM agent_records WHERE subject_key=? ORDER BY created_at", (key,)).fetchall()
+    if not rows:
+        return {"subject": key, "records": 0,
+                "note": "No history yet — Attestly builds a track record as this subject is checked over time."}
+    by_service = {}
+    for r in rows:
+        by_service.setdefault(r["service"], []).append(r)
+    latest = {svc: {"latest_verdict": rs[-1]["verdict"], "confidence": rs[-1]["confidence"],
+                    "checks": len(rs), "last_seen": rs[-1]["created_at"]}
+              for svc, rs in by_service.items()}
+    return {"subject": key, "subject_type": rows[0]["subject_type"], "records": len(rows),
+            "first_seen": rows[0]["created_at"], "last_seen": rows[-1]["created_at"],
+            "by_service": latest,
+            "note": "Point-in-time signals accumulated over time, not a guarantee. History deepens with use."}
 
 # ---- Fulfillment ----
 class CompleteRequest(BaseModel):
@@ -1225,6 +1401,38 @@ def admin_stats(x_admin_token: str | None = Header(default=None)):
     return {"total_jobs": total, "pending": pending, "completed": completed,
             "revenue_usd": verified_revenue, "gross_completed_usd": gross,
             "by_service": by_service}
+
+@app.get("/admin/profiles")
+def admin_profiles(x_admin_token: str | None = Header(default=None)):
+    """The data asset growing: how many bureau rows, how many distinct subjects, and the most-checked."""
+    require_admin(x_admin_token)
+    with closing(db()) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS agent_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, subject_key TEXT NOT NULL, subject_type TEXT NOT NULL,
+            service TEXT NOT NULL, verdict TEXT, confidence INTEGER, summary TEXT,
+            facts TEXT, attestation_id TEXT, payment_status TEXT, created_at TEXT NOT NULL)""")
+        total = conn.execute("SELECT COUNT(*) c FROM agent_records").fetchone()["c"]
+        subjects = conn.execute("SELECT COUNT(DISTINCT subject_key) c FROM agent_records").fetchone()["c"]
+        by_type = conn.execute("SELECT subject_type, COUNT(DISTINCT subject_key) c FROM agent_records GROUP BY subject_type").fetchall()
+        top = conn.execute("SELECT subject_key, subject_type, COUNT(*) n, MIN(created_at) f, MAX(created_at) l "
+                           "FROM agent_records GROUP BY subject_key ORDER BY n DESC LIMIT 50").fetchall()
+    return {"total_records": total, "distinct_subjects": subjects,
+            "subjects_by_type": {r["subject_type"]: r["c"] for r in by_type},
+            "top_subjects": [{"subject": r["subject_key"], "type": r["subject_type"], "checks": r["n"],
+                              "first_seen": r["f"], "last_seen": r["l"]} for r in top],
+            "note": "This is the memory. It compounds every time a subject is checked — the moat a competitor can't backfill."}
+
+@app.get("/admin/guardrails")
+def admin_guardrails(x_admin_token: str | None = Header(default=None)):
+    """Cost/abuse guardrail status — confirm free can't turn into expensive or abused."""
+    require_admin(x_admin_token)
+    return {"auto_checks_enabled": AUTO_CHECKS_ENABLED, "all_auto_free": ALL_AUTO_FREE,
+            "free_daily_ceiling": FREE_DAILY_CEILING, "today": _DAILY.get("day"),
+            "today_auto_count": _DAILY.get("count", 0), "rate_per_min": RATE_PER_MIN,
+            "cache_ttl_min": CACHE_TTL_MIN, "cache_entries": len(_AUTO_CACHE),
+            "spike_alert_at": SPIKE_ALERT_AT,
+            "note": "No automated check calls a paid per-request API — a spike is load on a fixed box, not a bill. "
+                    "Kill-switch: set AUTO_CHECKS_ENABLED=false."}
 
 @app.get("/admin/pending")
 def admin_pending(x_admin_token: str | None = Header(default=None)):
