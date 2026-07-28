@@ -337,6 +337,65 @@ def canonical_payload(row) -> str:
 # ----------------------------------------------------------------------------
 # Payment (x402)
 # ----------------------------------------------------------------------------
+# x402 Bazaar (Coinbase CDP discovery layer) — declared on PAID endpoints so the
+# facilitator indexes them the first time a payment settles. Per-service input/output.
+_BAZAAR_EXAMPLES = {
+    "entity_check": {
+        "input": {"service": "entity_check", "subject": {"business": "Acme Lending LLC", "state": "AZ"}},
+        "subject_props": {"business": {"type": "string"}, "state": {"type": "string"}},
+        "subject_required": ["business"],
+        "output": {"status": "completed", "verdict": "confirmed", "confidence": 0.92,
+                   "attestation_id": "at_1a2b3c4d5e6f7080",
+                   "data": {"name": "Acme Lending LLC", "status": "active", "jurisdiction": "AZ"},
+                   "signature": "<ed25519 hex signature>", "public_key": "<ed25519 hex public key>"},
+    },
+    "claim_check": {
+        "input": {"service": "claim_check",
+                  "subject": {"claim": "example.com is the official site of Example Corp",
+                              "url": "https://example.com"}},
+        "subject_props": {"claim": {"type": "string"}, "url": {"type": "string"}},
+        "subject_required": ["claim"],
+        "output": {"status": "completed", "verdict": "confirmed", "confidence": 0.88,
+                   "attestation_id": "at_9f8e7d6c5b4a3021",
+                   "data": {"claim": "example.com is the official site of Example Corp",
+                            "sources": ["https://example.com/about"]},
+                   "signature": "<ed25519 hex signature>", "public_key": "<ed25519 hex public key>"},
+    },
+}
+
+def _bazaar_extension(service_key):
+    """Return (v2_extension, v1_output_schema) for a paid, discoverable endpoint, else (None, None)."""
+    spec = _BAZAAR_EXAMPLES.get(service_key)
+    if not spec:
+        return None, None
+    svc = SERVICES[service_key]
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "service": {"type": "string", "enum": [service_key]},
+            "subject": {"type": "object", "properties": spec["subject_props"],
+                        "required": spec["subject_required"]},
+        },
+        "required": ["service", "subject"],
+    }
+    ext = {
+        "info": {"method": "POST", "input": spec["input"], "bodyType": "json",
+                 "output": {"example": spec["output"]}},
+        "schema": input_schema,
+        "description": svc["description"],
+    }
+    output_schema = {
+        "type": "object", "description": svc["description"],
+        "properties": {
+            "status": {"type": "string"},
+            "verdict": {"type": "string", "enum": ["confirmed", "refuted", "uncertain"]},
+            "confidence": {"type": "number"}, "attestation_id": {"type": "string"},
+            "data": {"type": "object"}, "signature": {"type": "string"}, "public_key": {"type": "string"},
+        },
+        "example": spec["output"],
+    }
+    return ext, output_schema
+
 def x402_challenge(service_key: str) -> JSONResponse:
     svc = SERVICES[service_key]
     accepts = []
@@ -355,13 +414,24 @@ def x402_challenge(service_key: str) -> JSONResponse:
                         "amount": f"{svc['price_usd']:.2f}", "payTo": PAYTO_ADDRESS,
                         "resource": f"{BASE_URL}/v1/verify", "description": svc["title"],
                         "mimeType": "application/json"})
-    return JSONResponse(status_code=402, content={
+    content = {
         "x402Version": 2 if _X402_OK else 1, "error": "payment_required",
         "accepts": accepts,
         "note": "Pay the amount above in USDC, then retry with header 'X-PAYMENT: <payload>'.",
         "pricing_notice": pricing_notice(service_key),
         "pricing_url": f"{BASE_URL}/pricing",
-    })
+    }
+    # Attach x402 Bazaar discovery declaration on paid endpoints (indexed on first settle).
+    try:
+        _ext, _out = _bazaar_extension(service_key)
+        if _ext:
+            content["extensions"] = {"bazaar": _ext}
+            for _req in accepts:
+                if isinstance(_req, dict):
+                    _req.setdefault("outputSchema", _out)
+    except Exception:
+        pass
+    return JSONResponse(status_code=402, content=content)
 
 def check_payment(proof: str | None, service_key: str) -> tuple[bool, str, str | None]:
     """
