@@ -1043,28 +1043,28 @@ def _auto_tool(service: str, subject: dict, payment: str):
 
 @_mcp.tool
 def notarize(content: str = "", sha256: str = "", payment: str = "") -> dict:
-    """Instantly notarize content: get an ed25519-signed proof it existed at this time. 0.50 USDC.
+    """Instantly notarize content: get an ed25519-signed proof it existed at this time. Free — no payment required.
     Provide 'content' to hash (only the hash is stored, never the raw content), or a 64-char hex 'sha256'.
     payment: your x402 proof. Omit to receive payment requirements first. Proves existence at time T, not authorship."""
     return _auto_tool("notarize", {"content": content, "sha256": sha256}, payment)
 
 @_mcp.tool
 def domain_check(domain: str, payment: str = "") -> dict:
-    """Instantly verify a domain/website: does it resolve, is TLS valid, how old, registrar, reachable. 0.50 USDC.
+    """Instantly verify a domain/website: does it resolve, is TLS valid, how old, registrar, reachable. Free — no payment required.
     Returns a signed verdict (confirmed/refuted/uncertain) with evidence. payment: your x402 proof; omit to get requirements first.
     Informational — 'resolves + valid cert' is not proof the business is trustworthy."""
     return _auto_tool("domain_check", {"domain": domain}, payment)
 
 @_mcp.tool
 def email_check(email: str, payment: str = "") -> dict:
-    """Instantly verify an email address: syntax, MX records, disposable-domain detection, deliverability signal. 0.50 USDC.
+    """Instantly verify an email address: syntax, MX records, disposable-domain detection, deliverability signal. Free — no payment required.
     Returns a signed verdict with evidence. payment: your x402 proof; omit to get requirements first.
     Deliverability is best-effort; a 'valid' result is not a guarantee of inbox delivery."""
     return _auto_tool("email_check", {"email": email}, payment)
 
 @_mcp.tool
 def wallet_screen(address: str, network: str = "base", payment: str = "") -> dict:
-    """Instantly screen an EVM address against OFAC sanctions + on-chain activity before you pay a counterparty. 1.00 USDC.
+    """Instantly screen an EVM address against OFAC sanctions + on-chain activity before you pay a counterparty. Free — no payment required.
     Returns a signed verdict with risk level and evidence. network: 'base' or 'ethereum'. payment: your x402 proof; omit to get requirements first.
     Informational screening only — NOT compliance, legal, or financial advice, and not 'KYC-certified'."""
     return _auto_tool("wallet_screen", {"address": address, "network": network}, payment)
@@ -1072,7 +1072,7 @@ def wallet_screen(address: str, network: str = "base", payment: str = "") -> dic
 @_mcp.tool
 def agent_verify(agent: str, public_key: str = "", message: str = "", signature: str = "",
                  expected_name: str = "", payment: str = "") -> dict:
-    """Instantly verify another agent's identity before you trust or transact with it. 0.75 USDC.
+    """Instantly verify another agent's identity before you trust or transact with it. Free — no payment required.
     agent: the other agent's domain (example.com) or full agent-card URL.
     Checks its A2A agent card is valid, that it controls the claimed domain (DNS/TLS/host match), and — if you pass
     public_key + message + signature — cryptographically verifies it controls its key. expected_name: optional name to match.
@@ -1119,7 +1119,7 @@ def healthz():
 def manifest():
     return {
         "name": BRAND, "type": "a2a-verification-service",
-        "summary": "The trust layer for AI agents: instant automated checks (wallet/sanctions, domain, email, notarization) plus human-verified attestations — all cryptographically signed (ed25519). Pay per check in USDC via x402.",
+        "summary": "The trust layer for AI agents: instant automated checks (wallet/sanctions, domain, email, notarization) plus human-verified attestations — all cryptographically signed (ed25519). Automated checks are free; human-verified attestations are paid in USDC via x402.",
         "public_key": PUBLIC_KEY_HEX,
         "verify_signature": "ed25519 over the canonical JSON at /v1/attestations/{id}?canonical=1",
         "payment": {"protocol": "x402", "network": PAY_NETWORK_CAIP, "asset": PAY_ASSET, "pay_to": PAYTO_ADDRESS},
@@ -1157,11 +1157,16 @@ def pricing_txt():
 def pubkey():
     return {"algo": "ed25519", "public_key_hex": PUBLIC_KEY_HEX}
 
+def _svc_price(key):
+    """Human-readable price label for a service: 'Free' while it's free, else 'X.XX USDC'."""
+    v = SERVICES[key]
+    return "Free" if v.get("price_usd", 0) <= 0 else "%.2f USDC" % v["price_usd"]
+
 def _agent_card():
     return {
         "protocolVersion": "0.3.0",
         "name": BRAND,
-        "description": "The trust layer for AI agents. Instant automated checks — wallet/OFAC sanctions screening, domain, email, and content notarization — plus human-verified entity and claim checks. Every result is a cryptographically signed (ed25519) attestation. Pay per check in USDC via x402.",
+        "description": "The trust layer for AI agents. Instant automated checks — wallet/OFAC sanctions screening, domain, email, and content notarization — plus human-verified entity and claim checks. Every result is a cryptographically signed (ed25519) attestation. Automated checks are free; human-verified attestations are paid in USDC via x402.",
         "url": BASE_URL,
         "preferredTransport": "JSONRPC",
         "version": "0.2.0",
@@ -1172,23 +1177,23 @@ def _agent_card():
         "defaultOutputModes": ["application/json"],
         "skills": [
             {"id": "entity-check", "name": "Human-verified entity check",
-             "description": "A real human confirms whether a business/entity exists and matches the details provided; returns a signed verdict with evidence. Price: %.2f USDC." % SERVICES["entity_check"]["price_usd"],
+             "description": "A real human confirms whether a business/entity exists and matches the details provided; returns a signed verdict with evidence. Price: %s." % _svc_price("entity_check"),
              "tags": ["verification", "kyb", "entity", "trust", "x402"],
              "examples": ["Is 'Acme Lending LLC' a registered active business in Arizona?"]},
             {"id": "claim-check", "name": "Human-verified claim check",
-             "description": "A real human checks a factual claim or URL against real sources; returns confirmed/refuted/uncertain with evidence. Price: %.2f USDC." % SERVICES["claim_check"]["price_usd"],
+             "description": "A real human checks a factual claim or URL against real sources; returns confirmed/refuted/uncertain with evidence. Price: %s." % _svc_price("claim_check"),
              "tags": ["verification", "fact-check", "trust", "x402"],
              "examples": ["Verify: 'https://example.com is the official site of Example Corp.'"]},
             {"id": "wallet-screen", "name": "Wallet risk & sanctions screening (instant)",
-             "description": "Instantly screen an EVM address against OFAC sanctions + on-chain activity; returns a signed risk verdict. Informational, not compliance advice. Price: %.2f USDC." % SERVICES["wallet_screen"]["price_usd"],
+             "description": "Instantly screen an EVM address against OFAC sanctions + on-chain activity; returns a signed risk verdict. Informational, not compliance advice. Price: %s." % _svc_price("wallet_screen"),
              "tags": ["verification", "wallet", "sanctions", "ofac", "risk", "x402", "instant"],
              "examples": ["Screen 0x1234...abcd on base before I send USDC."]},
             {"id": "domain-check", "name": "Domain & website verification (instant)",
-             "description": "Instantly check whether a domain resolves, has valid TLS, its age and registrar, and reachability; returns a signed verdict. Price: %.2f USDC." % SERVICES["domain_check"]["price_usd"],
+             "description": "Instantly check whether a domain resolves, has valid TLS, its age and registrar, and reachability; returns a signed verdict. Price: %s." % _svc_price("domain_check"),
              "tags": ["verification", "domain", "website", "tls", "x402", "instant"],
              "examples": ["Is stripe.com a real, resolving site with valid TLS?"]},
             {"id": "email-check", "name": "Email verification (instant)",
-             "description": "Instantly check an email's syntax, MX records, disposable-domain status, and deliverability signal; returns a signed verdict. Price: %.2f USDC." % SERVICES["email_check"]["price_usd"],
+             "description": "Instantly check an email's syntax, MX records, disposable-domain status, and deliverability signal; returns a signed verdict. Price: %s." % _svc_price("email_check"),
              "tags": ["verification", "email", "deliverability", "x402", "instant"],
              "examples": ["Is user@example.com a deliverable, non-disposable address?"]},
             {"id": "notarize", "name": "Content notarization (instant, FREE)",
@@ -1196,7 +1201,7 @@ def _agent_card():
              "tags": ["notary", "timestamp", "hash", "proof", "x402", "instant", "free"],
              "examples": ["Notarize the SHA-256 of this agreement text."]},
             {"id": "agent-verify", "name": "Agent identity verification (instant)",
-             "description": "Instantly verify another agent is who it claims: validates its A2A agent card, confirms domain control (DNS/TLS/host match), and optionally verifies ed25519 key control via a signed message. Know your counterparty agent before you trust or transact. Price: %.2f USDC." % SERVICES["agent_verify"]["price_usd"],
+             "description": "Instantly verify another agent is who it claims: validates its A2A agent card, confirms domain control (DNS/TLS/host match), and optionally verifies ed25519 key control via a signed message. Know your counterparty agent before you trust or transact. Price: %s." % _svc_price("agent_verify"),
              "tags": ["verification", "agent", "identity", "a2a", "trust", "x402", "instant"],
              "examples": ["Verify the agent at partner-agent.com is legitimate before I delegate to it."]},
         ],
@@ -1212,13 +1217,13 @@ def agent_card():
 def llms_txt():
     return f"""# {BRAND}
 
-> The trust layer for AI agents. Instant automated checks plus human-verified attestations, all cryptographically signed (ed25519). Pay per check in USDC via the x402 protocol. Verdicts: confirmed / refuted / uncertain, with evidence and a confidence score.
+> The trust layer for AI agents. Instant automated checks plus human-verified attestations, all cryptographically signed (ed25519). Automated checks are free; human-verified attestations are paid in USDC via the x402 protocol. Verdicts: confirmed / refuted / uncertain, with evidence and a confidence score.
 
 ## Instant automated checks (signed result in the same response)
-- wallet_screen (${SERVICES['wallet_screen']['price_usd']:.2f} USDC): screen an EVM address vs OFAC sanctions + on-chain activity before you pay a counterparty. Informational, not compliance advice.
-- agent_verify (${SERVICES['agent_verify']['price_usd']:.2f} USDC): verify another agent is who it claims — validates its A2A agent card, domain control (DNS/TLS), and optional ed25519 key control. Know your counterparty agent before you trust or transact.
-- domain_check (${SERVICES['domain_check']['price_usd']:.2f} USDC): does a domain resolve, valid TLS, age, registrar, reachability.
-- email_check (${SERVICES['email_check']['price_usd']:.2f} USDC): syntax, MX records, disposable-domain detection, deliverability signal.
+- wallet_screen ({_svc_price('wallet_screen')}): screen an EVM address vs OFAC sanctions + on-chain activity before you pay a counterparty. Informational, not compliance advice.
+- agent_verify ({_svc_price('agent_verify')}): verify another agent is who it claims — validates its A2A agent card, domain control (DNS/TLS), and optional ed25519 key control. Know your counterparty agent before you trust or transact.
+- domain_check ({_svc_price('domain_check')}): does a domain resolve, valid TLS, age, registrar, reachability.
+- email_check ({_svc_price('email_check')}): syntax, MX records, disposable-domain detection, deliverability signal.
 - notarize (FREE): signed proof that content (or its hash) existed at time T. Existence, not authorship. No payment required — the easiest way to try Attestly.
 
 ## Human-verified checks (reviewed by a real person, usually within hours)
@@ -1540,8 +1545,8 @@ def home():
       <h1 style="font-size:40px;margin:.1em 0 .2em">The trust layer for AI agents.</h1>
       <p style="font-size:20px;color:#444">Agents can pay for things now — but they can't tell what's actually true.
       {BRAND} gives them signed answers: <b>instant automated checks</b> for wallets, domains, emails and content,
-      plus <b>human-verified attestations</b> for the calls that need judgment. Pay per check in USDC. Every result is
-      cryptographically signed — verify it yourself.</p>
+      plus <b>human-verified attestations</b> for the calls that need judgment. <b>Automated checks are free</b>; human-verified
+      attestations are paid in USDC. Every result is cryptographically signed — verify it yourself.</p>
 
       <h3 style="margin-top:34px">Instant automated checks</h3>
       <p style="color:#666;margin-top:2px">Signed result in the same response — no waiting, no human.</p>
@@ -1551,10 +1556,10 @@ def home():
       <p style="color:#666;margin-top:2px">A real person verifies against primary sources — for the calls automation can't make.</p>
       <div style="display:flex;gap:16px;flex-wrap:wrap;margin:14px 0 8px">{human_cards}</div>
       <div style="display:inline-block;background:#eaf1fb;color:#2F5496;font-size:11px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;padding:3px 8px;border-radius:999px">Introductory pricing</div>
-      <p style="color:#666;font-size:13.5px;margin:10px 0 0">Notarization is free to start. Introductory rates are intentionally low while we build a track record — prices will rise as the service matures, always with advance notice, and the price quoted when your agent calls is locked for that request. <a href="/pricing" style="color:#2F5496">Full pricing terms →</a></p>
+      <p style="color:#666;font-size:13.5px;margin:10px 0 0">All automated checks are free right now. The human-verified checks use introductory rates — intentionally low while we build a track record — and prices will rise as the service matures, always with advance notice, with the price quoted when your agent calls locked for that request. <a href="/pricing" style="color:#2F5496">Full pricing terms →</a></p>
 
       <h3 style="margin-top:32px">How it works</h3>
-      <ol><li>Your agent calls <code>POST /v1/verify</code> (or the hosted MCP server at <code>/mcp</code>) and pays via x402 (USDC).</li>
+      <ol><li>Your agent calls <code>POST /v1/verify</code> (or the hosted MCP server at <code>/mcp</code>) — automated checks are free; human-verified checks are paid via x402 (USDC).</li>
       <li>Automated checks run instantly; human checks are verified against primary sources.</li>
       <li>You get a signed verdict (confirmed / refuted / uncertain) with evidence.</li>
       <li>Anyone can verify the ed25519 signature — trust, provable.</li></ol>
