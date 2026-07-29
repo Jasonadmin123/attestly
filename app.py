@@ -1203,7 +1203,7 @@ def seed_page():
 <script type="module">
 import { createWalletClient, custom } from "https://esm.sh/viem@2";
 import { base } from "https://esm.sh/viem@2/chains";
-import { wrapFetchWithPayment } from "https://esm.sh/x402-fetch?deps=viem@2";
+import { wrapFetchWithPayment } from "https://cdn.jsdelivr.net/npm/x402-fetch/+esm";
 const el = document.getElementById("log");
 const NL = String.fromCharCode(10);
 const log = (m) => { el.textContent += m + NL; };
