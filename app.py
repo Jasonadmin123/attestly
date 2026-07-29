@@ -54,6 +54,7 @@ DB_PATH        = os.environ.get("ATTESTLY_DB", "attestly.db")
 KEY_PATH       = os.environ.get("ATTESTLY_KEY", "signing_key.hex")
 ADMIN_TOKEN    = os.environ.get("ADMIN_TOKEN", "change-me")
 PAYTO_ADDRESS  = os.environ.get("PAYTO_ADDRESS", "0xYOUR_WALLET_ADDRESS")
+SEED_PAYTO     = os.environ.get("SEED_PAYTO", "0x8afaD68D1fF543a4ef71E1b1e6e1A0449edABfDf")  # seed recipient; payer != payee (CDP blocks self-pay)
 PAY_NETWORK    = os.environ.get("PAY_NETWORK", "base")
 PAY_ASSET      = os.environ.get("PAY_ASSET", "USDC")
 BASE_URL       = os.environ.get("BASE_URL", "http://localhost:8000")
@@ -135,7 +136,7 @@ def _payment_requirements(service_key: str):
     svc = SERVICES[service_key]
     atomic = str(int(round(svc["price_usd"] * (10 ** _X402_ASSET["decimals"]))))
     return _PayReq(scheme="exact", network=PAY_NETWORK_CAIP, asset=_X402_ASSET["address"],
-                   amount=atomic, pay_to=PAYTO_ADDRESS, max_timeout_seconds=300,
+                   amount=atomic, pay_to=(SEED_PAYTO if service_key == "seed_check" else PAYTO_ADDRESS), max_timeout_seconds=300,
                    extra={"name": _X402_ASSET["name"], "version": _X402_ASSET["version"]})
 
 def facilitator_active() -> bool:
@@ -186,6 +187,11 @@ SERVICES = {
     "claim_check": {
         "title": "Human-verified claim check",
         "description": "A real human checks a factual claim or URL against real sources and returns confirmed / refuted / uncertain, with evidence and a signed verdict.",
+        "price_usd": 4.00,
+    },
+    "seed_check": {
+        "title": "Bazaar registration (internal)",
+        "description": "One-time internal payment to register Attestly in the x402 Bazaar.",
         "price_usd": 4.00,
     },
     "notarize": {
@@ -365,14 +371,14 @@ _BAZAAR_EXAMPLES = {
 
 def _bazaar_extension(service_key):
     """Return (v2_extension, v1_output_schema) for a paid, discoverable endpoint, else (None, None)."""
-    spec = _BAZAAR_EXAMPLES.get(service_key)
+    spec = _BAZAAR_EXAMPLES.get("entity_check" if service_key == "seed_check" else service_key)
     if not spec:
         return None, None
-    svc = SERVICES[service_key]
+    svc = SERVICES["entity_check" if service_key == "seed_check" else service_key]
     input_schema = {
         "type": "object",
         "properties": {
-            "service": {"type": "string", "enum": [service_key]},
+            "service": {"type": "string", "enum": ["entity_check" if service_key == "seed_check" else service_key]},
             "subject": {"type": "object", "properties": spec["subject_props"],
                         "required": spec["subject_required"]},
         },
@@ -1225,7 +1231,7 @@ btn.onclick = async () => {
     log("Connected: " + address);
     try { await provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x2105" }] }); }
     catch (e) { log("If prompted, switch the wallet to the Base network."); }
-    const body = JSON.stringify({ service: "entity_check", subject: { business: "Attestly Bazaar Seed", state: "AZ" } });
+    const body = JSON.stringify({ service: "seed_check", subject: { business: "Attestly Bazaar Seed", state: "AZ" } });
     log("Fetching payment requirements...");
     const chalRes = await fetch("/v1/verify", { method: "POST", headers: { "content-type": "application/json" }, body: body });
     if (chalRes.status !== 402) { log("Unexpected: expected 402, got " + chalRes.status); log((await chalRes.text()).slice(0,600)); btn.disabled=false; return; }
