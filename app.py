@@ -99,6 +99,12 @@ try:
 except Exception:
     _X402_OK = False
 
+try:
+    from x402.extensions.bazaar import declare_discovery_extension as _declare_disc, OutputConfig as _OutputConfig
+except Exception:
+    _declare_disc = None
+    _OutputConfig = None
+
 # Facilitator URL: explicit override, else CDP for mainnet, else public testnet facilitator.
 if FACILITATOR_URL:
     _FAC_URL = FACILITATOR_URL
@@ -384,12 +390,11 @@ def _bazaar_extension(service_key):
         },
         "required": ["service", "subject"],
     }
-    ext = {
-        "info": {"method": "POST", "input": spec["input"], "bodyType": "json",
-                 "output": {"example": spec["output"]}},
-        "schema": input_schema,
-        "description": svc["description"],
-    }
+    if not _declare_disc:
+        return None, None
+    _decl = _declare_disc(input=spec["input"], input_schema=input_schema,
+                          body_type="json", output=_OutputConfig(example=spec["output"]))
+    ext = _decl["bazaar"]
     output_schema = {
         "type": "object", "description": svc["description"],
         "properties": {
