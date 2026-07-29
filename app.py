@@ -1536,6 +1536,32 @@ def admin_facilitator(x_admin_token: str | None = Header(default=None)):
             info["error"] = f"{type(e).__name__}: {str(e)[:300]}"
     return info
 
+@app.post("/admin/paytest")
+def admin_paytest(x_admin_token: str | None = Header(default=None), x_payment: str | None = Header(default=None)):
+    """Diagnostic: run the facilitator verify() on a supplied X-PAYMENT and surface the raw result or exception."""
+    require_admin(x_admin_token)
+    out = {"facilitator_active": facilitator_active(), "network_caip": PAY_NETWORK_CAIP}
+    if not x_payment:
+        out["error"] = "provide the X-PAYMENT header"
+        return out
+    try:
+        payload = _parse_payload(json.loads(_b64d(x_payment)))
+        out["parsed"] = True
+    except Exception as e:
+        out["parse_error"] = f"{type(e).__name__}: {str(e)[:400]}"
+        return out
+    try:
+        reqs = _payment_requirements("entity_check")
+        v = _facilitator().verify(payload, reqs)
+        out["verify_is_valid"] = getattr(v, "is_valid", None)
+        out["verify_reason"] = getattr(v, "invalid_reason", None) or getattr(v, "reason", None)
+        out["verify_repr"] = str(v)[:600]
+    except Exception as e:
+        import traceback
+        out["verify_error"] = f"{type(e).__name__}: {str(e)[:600]}"
+        out["verify_trace"] = traceback.format_exc()[-1200:]
+    return out
+
 @app.get("/admin/metrics")
 def admin_metrics(x_admin_token: str | None = Header(default=None)):
     """Traffic to discovery + intent endpoints — who's looking, and who's hitting the paywall."""
