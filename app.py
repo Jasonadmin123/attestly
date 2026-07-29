@@ -1181,6 +1181,77 @@ async def _traffic_metrics_mw(request, call_next):
         pass
     return response
 
+@app.get("/seed", response_class=HTMLResponse)
+def seed_page():
+    return HTMLResponse("""<!doctype html>
+<meta charset="utf-8">
+<title>Attestly - Bazaar seed</title>
+<style>
+  body{font-family:system-ui,Segoe UI,Arial,sans-serif;max-width:640px;margin:6vh auto;padding:0 20px;color:#1a1a1a}
+  h1{color:#2F5496;font-size:22px}
+  p{color:#444;line-height:1.5}
+  button{background:#2F5496;color:#fff;border:0;border-radius:8px;padding:12px 18px;font-size:15px;cursor:pointer}
+  button:disabled{opacity:.6;cursor:default}
+  pre{background:#0b1020;color:#cfe;padding:14px;border-radius:8px;white-space:pre-wrap;word-break:break-word;font-size:12.5px;margin-top:18px}
+  code{background:#eef;padding:1px 5px;border-radius:4px}
+</style>
+<h1>Attestly - list on the x402 Bazaar</h1>
+<p>This makes one real <code>entity_check</code> payment from your connected Coinbase Wallet to Attestly's own payout wallet. That single on-chain settlement is what registers Attestly in the x402 Bazaar. You sign a gasless authorization (no ETH needed); the USDC goes to Attestly's treasury.</p>
+<p>Make sure your Coinbase Wallet holds a few dollars of USDC on <b>Base</b> first.</p>
+<button id="go">Connect Coinbase Wallet and pay</button>
+<pre id="log">Ready.</pre>
+<script type="module">
+import { createWalletClient, custom } from "https://esm.sh/viem@2";
+import { base } from "https://esm.sh/viem@2/chains";
+import { wrapFetchWithPayment } from "https://esm.sh/x402-fetch?deps=viem@2";
+const el = document.getElementById("log");
+const NL = String.fromCharCode(10);
+const log = (m) => { el.textContent += m + NL; };
+const btn = document.getElementById("go");
+function pickProvider(){
+  const e = window.ethereum;
+  if (window.coinbaseWalletExtension) return window.coinbaseWalletExtension;
+  if (e && Array.isArray(e.providers)) { const cb = e.providers.find(p => p && p.isCoinbaseWallet); if (cb) return cb; }
+  return e || null;
+}
+btn.onclick = async () => {
+  btn.disabled = true;
+  try {
+    const provider = pickProvider();
+    if (!provider) { log("No wallet detected. Enable the Coinbase Wallet extension, then reload."); btn.disabled = false; return; }
+    const accts = await provider.request({ method: "eth_requestAccounts" });
+    const address = accts[0];
+    log("Connected: " + address);
+    try { await provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x2105" }] }); }
+    catch (e) { log("If prompted, switch the wallet to the Base network."); }
+    const walletClient = createWalletClient({ account: address, chain: base, transport: custom(provider) });
+    const payFetch = wrapFetchWithPayment(fetch, walletClient);
+    log("Requesting payment - approve the signature in your Coinbase Wallet popup.");
+    const res = await payFetch("/v1/verify", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ service: "entity_check", subject: { business: "Attestly Bazaar Seed", state: "AZ" } })
+    });
+    const text = await res.text();
+    log("HTTP " + res.status);
+    log(text.slice(0, 1000));
+    const pr = res.headers.get("x-payment-response");
+    if (pr) log("payment-response: " + pr);
+    log("");
+    if (res.status === 200 && text.indexOf("unverified_manual") === -1) {
+      log("Settled on-chain. Attestly should appear in the Bazaar within ~10 minutes.");
+    } else if (text.indexOf("unverified_manual") !== -1) {
+      log("Accepted without a real CDP settle (unverified_manual). The CDP keys may be inactive - nothing indexed.");
+    } else {
+      log("Payment did not complete. Read the response above.");
+    }
+  } catch (e) {
+    log("Error: " + (e && e.message ? e.message : String(e)));
+  }
+  btn.disabled = false;
+};
+</script>""")
+
 @app.get("/healthz")
 def healthz():
     return {"ok": True, "service": BRAND}
