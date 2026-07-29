@@ -192,7 +192,7 @@ SERVICES = {
     "seed_check": {
         "title": "Bazaar registration (internal)",
         "description": "One-time internal payment to register Attestly in the x402 Bazaar.",
-        "price_usd": 4.00,
+        "price_usd": 0.50,
     },
     "notarize": {
         "title": "Content notarization (signed timestamp)",
@@ -1260,7 +1260,7 @@ btn.onclick = async () => {
       payload: { authorization: { from: address, to: payTo, value: amount, validAfter: "0", validBefore: validBefore, nonce: nonce }, signature: signature },
       accepted: req,
       resource: null,
-      extensions: null
+      extensions: (chal.extensions || null)
     };
     const xpayment = btoa(JSON.stringify(envelope));
     log("Submitting payment...");
