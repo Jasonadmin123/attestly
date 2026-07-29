@@ -451,7 +451,7 @@ def check_payment(proof: str | None, service_key: str) -> tuple[bool, str, str |
     # Try the real facilitator path first.
     if facilitator_active():
         try:
-            payload = _parse_payload(_b64d(proof))          # base64 X-PAYMENT -> PaymentPayload
+            payload = _parse_payload(json.loads(_b64d(proof)))          # base64 X-PAYMENT -> PaymentPayload
         except Exception:
             payload = None
         if payload is not None:
@@ -1200,10 +1200,7 @@ def seed_page():
 <p>Make sure your Coinbase Wallet holds a few dollars of USDC on <b>Base</b> first.</p>
 <button id="go">Connect Coinbase Wallet and pay</button>
 <pre id="log">Ready.</pre>
-<script type="module">
-import { createWalletClient, custom } from "https://esm.sh/viem@2";
-import { base } from "https://esm.sh/viem@2/chains";
-import { wrapFetchWithPayment } from "https://cdn.jsdelivr.net/npm/x402-fetch/+esm";
+<script>
 const el = document.getElementById("log");
 const NL = String.fromCharCode(10);
 const log = (m) => { el.textContent += m + NL; };
@@ -1213,6 +1210,10 @@ function pickProvider(){
   if (window.coinbaseWalletExtension) return window.coinbaseWalletExtension;
   if (e && Array.isArray(e.providers)) { const cb = e.providers.find(p => p && p.isCoinbaseWallet); if (cb) return cb; }
   return e || null;
+}
+function hexNonce(){
+  const b = new Uint8Array(32); crypto.getRandomValues(b);
+  let s = "0x"; for (let i=0;i<b.length;i++){ s += b[i].toString(16).padStart(2,"0"); } return s;
 }
 btn.onclick = async () => {
   btn.disabled = true;
@@ -1224,26 +1225,53 @@ btn.onclick = async () => {
     log("Connected: " + address);
     try { await provider.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x2105" }] }); }
     catch (e) { log("If prompted, switch the wallet to the Base network."); }
-    const walletClient = createWalletClient({ account: address, chain: base, transport: custom(provider) });
-    const payFetch = wrapFetchWithPayment(fetch, walletClient);
-    log("Requesting payment - approve the signature in your Coinbase Wallet popup.");
-    const res = await payFetch("/v1/verify", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ service: "entity_check", subject: { business: "Attestly Bazaar Seed", state: "AZ" } })
-    });
-    const text = await res.text();
-    log("HTTP " + res.status);
-    log(text.slice(0, 1000));
-    const pr = res.headers.get("x-payment-response");
-    if (pr) log("payment-response: " + pr);
+    const body = JSON.stringify({ service: "entity_check", subject: { business: "Attestly Bazaar Seed", state: "AZ" } });
+    log("Fetching payment requirements...");
+    const chalRes = await fetch("/v1/verify", { method: "POST", headers: { "content-type": "application/json" }, body: body });
+    if (chalRes.status !== 402) { log("Unexpected: expected 402, got " + chalRes.status); log((await chalRes.text()).slice(0,600)); btn.disabled=false; return; }
+    const chal = await chalRes.json();
+    const req = chal.accepts[0];
+    const amount = String(req.amount || req.maxAmountRequired);
+    const payTo = req.payTo;
+    const asset = req.asset;
+    const extra = req.extra || { name: "USD Coin", version: "2" };
+    const nowSec = Math.floor(Date.now() / 1000);
+    const validBefore = String(nowSec + (req.maxTimeoutSeconds || 300));
+    const nonce = hexNonce();
+    const typed = {
+      types: {
+        EIP712Domain: [ {name:"name",type:"string"}, {name:"version",type:"string"}, {name:"chainId",type:"uint256"}, {name:"verifyingContract",type:"address"} ],
+        TransferWithAuthorization: [ {name:"from",type:"address"}, {name:"to",type:"address"}, {name:"value",type:"uint256"}, {name:"validAfter",type:"uint256"}, {name:"validBefore",type:"uint256"}, {name:"nonce",type:"bytes32"} ]
+      },
+      domain: { name: extra.name, version: extra.version, chainId: 8453, verifyingContract: asset },
+      primaryType: "TransferWithAuthorization",
+      message: { from: address, to: payTo, value: amount, validAfter: "0", validBefore: validBefore, nonce: nonce }
+    };
+    log("Approve the signature in your Coinbase Wallet popup...");
+    const signature = await provider.request({ method: "eth_signTypedData_v4", params: [ address, JSON.stringify(typed) ] });
+    const envelope = {
+      x402Version: 2,
+      payload: { authorization: { from: address, to: payTo, value: amount, validAfter: "0", validBefore: validBefore, nonce: nonce }, signature: signature },
+      accepted: req,
+      resource: null,
+      extensions: null
+    };
+    const xpayment = btoa(JSON.stringify(envelope));
+    log("Submitting payment...");
+    const payRes = await fetch("/v1/verify", { method: "POST", headers: { "content-type": "application/json", "X-PAYMENT": xpayment }, body: body });
+    const text = await payRes.text();
+    let j = {}; try { j = JSON.parse(text); } catch (e) {}
+    log("HTTP " + payRes.status);
+    log(text.slice(0, 900));
     log("");
-    if (res.status === 200 && text.indexOf("unverified_manual") === -1) {
-      log("Settled on-chain. Attestly should appear in the Bazaar within ~10 minutes.");
-    } else if (text.indexOf("unverified_manual") !== -1) {
-      log("Accepted without a real CDP settle (unverified_manual). The CDP keys may be inactive - nothing indexed.");
+    if (payRes.status === 200 && j.payment_status === "verified") {
+      log("Settled on-chain (payment verified). Attestly should appear in the Bazaar within ~10 minutes.");
+    } else if (j.payment_status === "unverified_manual") {
+      log("Server accepted but did NOT settle through CDP (unverified_manual). CDP facilitator did not confirm - nothing indexed yet.");
+    } else if (payRes.status === 402) {
+      log("Payment was rejected (still 402). See the response above for the reason.");
     } else {
-      log("Payment did not complete. Read the response above.");
+      log("Unexpected result - read the response above.");
     }
   } catch (e) {
     log("Error: " + (e && e.message ? e.message : String(e)));
