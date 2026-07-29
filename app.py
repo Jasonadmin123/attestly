@@ -1530,7 +1530,7 @@ def admin_facilitator(x_admin_token: str | None = Header(default=None)):
             sup = _facilitator().get_supported()
             kinds = getattr(sup, "kinds", None) or getattr(sup, "supported", None) or sup
             info["get_supported_ok"] = True
-            info["supported_sample"] = str(kinds)[:500]
+            info["supported_sample"] = str(kinds)[:8000]
         except Exception as e:
             info["get_supported_ok"] = False
             info["error"] = f"{type(e).__name__}: {str(e)[:300]}"
