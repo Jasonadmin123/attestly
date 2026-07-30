@@ -1780,6 +1780,39 @@ def home():
     </body>""")
 
 # ---- Admin console (browser) ----
+# --- Bazaar diagnostic: capture CDP EXTENSION-RESPONSES header (verify/settle) ---
+_LAST_EXT_RESP = {}
+try:
+    import base64 as _b64ext
+    import x402.http.facilitator_client as _fcmod
+    def _capture_ext_resp(response):
+        try:
+            hdr = response.headers.get("EXTENSION-RESPONSES") or response.headers.get("extension-responses")
+            info = {"when": now_iso(), "status_code": getattr(response, "status_code", None), "header_present": bool(hdr)}
+            if hdr:
+                try:
+                    info["decoded"] = json.loads(_b64ext.b64decode(hdr).decode("utf-8"))
+                except Exception as _de:
+                    info["decode_error"] = str(_de); info["raw"] = str(hdr)[:400]
+            else:
+                try:
+                    info["headers_seen"] = sorted(response.headers.keys())
+                except Exception:
+                    info["headers_seen"] = None
+            _LAST_EXT_RESP.clear(); _LAST_EXT_RESP.update(info)
+        except Exception as _ce:
+            _LAST_EXT_RESP.clear(); _LAST_EXT_RESP.update({"capture_error": str(_ce)})
+    _fcmod._log_extension_responses_header = _capture_ext_resp
+except Exception as _ie:
+    _LAST_EXT_RESP["init_error"] = str(_ie)
+
+@app.get("/admin/extresp")
+def admin_extresp(x_admin_token: str | None = Header(default=None)):
+    require_admin(x_admin_token)
+    return {"last_extension_responses": (dict(_LAST_EXT_RESP) or None),
+            "note": "Coinbase per-settlement status for our bazaar discovery extension. header_present=false means CDP returned NO EXTENSION-RESPONSES header at all. Make one paid settle, then read this."}
+
+
 @app.get("/admin", response_class=HTMLResponse)
 def admin_console():
     return HTMLResponse("""<!doctype html><meta charset=utf-8><title>Attestly admin</title>
