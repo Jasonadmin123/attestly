@@ -54,7 +54,7 @@ DB_PATH        = os.environ.get("ATTESTLY_DB", "attestly.db")
 KEY_PATH       = os.environ.get("ATTESTLY_KEY", "signing_key.hex")
 ADMIN_TOKEN    = os.environ.get("ADMIN_TOKEN", "change-me")
 PAYTO_ADDRESS  = os.environ.get("PAYTO_ADDRESS", "0xYOUR_WALLET_ADDRESS")
-SEED_PAYTO     = os.environ.get("SEED_PAYTO", "0x7a3fe058B5EAF1Ea6b862D2E6C0b74C965F7B73b")  # seed recipient; payer != payee (CDP blocks self-pay)
+SEED_PAYTO     = os.environ.get("SEED_PAYTO", "0x8afaD68D1fF543a4ef71E1b1e6e1A0449edABfDf")  # seed recipient; payer != payee (CDP blocks self-pay)
 PAY_NETWORK    = os.environ.get("PAY_NETWORK", "base")
 PAY_ASSET      = os.environ.get("PAY_ASSET", "USDC")
 BASE_URL       = os.environ.get("BASE_URL", "http://localhost:8000")
@@ -198,7 +198,7 @@ SERVICES = {
     "seed_check": {
         "title": "Bazaar registration (internal)",
         "description": "One-time internal payment to register Attestly in the x402 Bazaar.",
-        "price_usd": 4.50,
+        "price_usd": 0.10,
     },
     "notarize": {
         "title": "Content notarization (signed timestamp)",
